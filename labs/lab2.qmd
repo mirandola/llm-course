@@ -1,0 +1,631 @@
+---
+title: "Lab 2 — Attention and the Transformer block in plain PyTorch"
+subtitle: "Module 2 · Lab (M2P2) · Week 2"
+author: "Heudson Mirandola"
+execute:
+  enabled: false
+---
+
+<!-- page-only -->
+[![Open the student notebook in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mirandola/llm-course/blob/main/labs/M2P2_lab2_student.ipynb)
+This page shows the lab with solutions; students work in the notebook.
+<!-- /page-only -->
+
+
+## What you will build
+
+By the end of this lab you will have, in one notebook:
+
+1. **scaled dot-product attention** with a causal mask, written from the formula and
+   checked against PyTorch's fused implementation --- plus three small experiments on the
+   $\sqrt{d_k}$ scaling, the prefix property and the shape of attention patterns;
+2. **multi-head causal self-attention** as an `nn.Module`, in the layout that production
+   code uses, checked numerically against `nn.MultiheadAttention` with identical weights;
+3. the **pre-norm Transformer block** and the full decoder-only model, with a parameter
+   counter that reproduces $12Ld^2 + Vd + n_{\max}d$ for GPT-2's four sizes;
+4. a **time and memory profile** of attention as a function of the sequence length,
+   confirming the $n^2$ growth and locating where the naive implementation runs out of
+   memory --- and what FlashAttention changes.
+
+Everything follows the lecture notes (M2P1); section numbers in the text refer to them.
+The notes' Appendix B contains the reference implementation of parts 2 and 3; here you
+write it yourself and test it. Lab 3 trains the model you assemble today.
+
+**Deliverable.** This notebook, executed top to bottom, with the table of Section 4
+filled in, plus the written exercises of the notes, as a PDF.
+
+**Conventions.** `TODO` marks what you must write. Cells marked `# test` contain
+assertions that your code must pass; do not edit them. A GPU is needed only for Section 4
+(Colab: *Runtime → Change runtime type → T4 GPU*); Sections 1--3 run on CPU in seconds.
+
+```{python}
+#| label: setup
+import math, time, json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(torch.__version__, device)
+```
+
+---
+
+## 1. Scaled dot-product attention
+
+### 1.1 From the formula
+
+The boxed formula of Section 2.5: for $Q, K\in\mathbb{R}^{n\times d_k}$ and
+$V\in\mathbb{R}^{n\times d_v}$,
+$$\mathrm{Attention}(Q,K,V) = \mathrm{softmax}\!\Big(\frac{QK^{\top}}{\sqrt{d_k}} + M\Big)V,
+\qquad M_{ts} = \begin{cases}0 & s\le t\\ -\infty & s>t.\end{cases}$$
+
+Write it for tensors with any number of leading dimensions (`[..., n, d_k]`), so that the
+same function serves batched and multi-head inputs. Return the attention matrix as well;
+Section 1.4 looks at it.
+
+```{python}
+#| label: attention
+def attention(q, k, v, causal=True):
+    """q, k: [..., n, dk]; v: [..., n, dv]. Returns (output [..., n, dv], A [..., n, n])."""
+    n, dk = q.shape[-2], q.shape[-1]
+    # TODO: scores = q k^T / sqrt(dk); if causal, fill positions s > t with -inf
+    #       (torch.triu / torch.tril build the mask; masked_fill applies it);
+    #       A = softmax over the last dimension; output = A v
+    # --- SOLUTION START ---
+    s = q @ k.transpose(-2, -1) / math.sqrt(dk)                  # [..., n, n]
+    if causal:
+        mask = torch.triu(torch.ones(n, n, dtype=torch.bool, device=q.device), diagonal=1)
+        s = s.masked_fill(mask, float("-inf"))                   # s > t forbidden
+    A = F.softmax(s, dim=-1)
+    out = A @ v
+    # --- SOLUTION END ---
+    return out, A
+```
+
+```{python}
+#| label: attention-test
+# test: against PyTorch's fused kernel, batched and multi-head shapes, causal and not
+for shape in [(5, 8), (2, 5, 8), (2, 3, 7, 16)]:
+    q, k, v = (torch.randn(*shape) for _ in range(3))
+    for causal in (True, False):
+        ours, A = attention(q, k, v, causal=causal)
+        ref = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+        assert torch.allclose(ours, ref, atol=1e-5), (shape, causal)
+        assert torch.allclose(A.sum(-1), torch.ones_like(A.sum(-1)), atol=1e-5)
+        if causal:
+            assert torch.all(A.triu(1) == 0)      # lower triangular
+print("ok")
+```
+
+### 1.2 Why $\sqrt{d_k}$
+
+Section 2.3 argues that without the scaling the scores have standard deviation
+$\sqrt{d_k}$, the softmax saturates, and the gradient through it vanishes. Measure all
+three. For each $d_k$, draw $q, k$ with i.i.d. standard normal entries, and record: the
+standard deviation of the raw scores $q^{\top}k$; the mean of the largest attention weight
+in each row (1 means one-hot); and the norm of the gradient that reaches $q$ from a random
+upstream gradient on the output --- with and without the $1/\sqrt{d_k}$ factor.
+
+```{python}
+#| label: scaling
+def scaling_experiment(dk, n=64, trials=20):
+    rows = []
+    for scale in (1.0, 1.0 / math.sqrt(dk)):
+        stds, maxw, gnorm = [], [], []
+        for _ in range(trials):
+            q = torch.randn(n, dk, requires_grad=True)
+            k, v = torch.randn(n, dk), torch.randn(n, dk)
+            # TODO: s = scale * q k^T (no mask), A = softmax(s), out = A v;
+            #       backprop a random upstream gradient g (same shape as out) into q;
+            #       record s.std(), A.max(-1).values.mean(), q.grad.norm()
+            # --- SOLUTION START ---
+            s = scale * (q @ k.T)
+            A = F.softmax(s, dim=-1)
+            out = A @ v
+            out.backward(torch.randn_like(out))
+            stds.append(s.std().item()); maxw.append(A.max(-1).values.mean().item())
+            gnorm.append(q.grad.norm().item())
+            # --- SOLUTION END ---
+        rows.append((dk, "none" if scale == 1.0 else "1/sqrt(dk)",
+                     sum(stds) / trials, sum(maxw) / trials, sum(gnorm) / trials))
+    return rows
+
+print(f"{'dk':>5} {'scaling':>11} {'std(scores)':>12} {'mean max weight':>16} {'|grad q|':>10}")
+for dk in (16, 64, 256, 1024):
+    for r in scaling_experiment(dk):
+        print(f"{r[0]:5d} {r[1]:>11} {r[2]:12.2f} {r[3]:16.3f} {r[4]:10.4f}")
+```
+
+**Question 1.** Read the table against the proposition of Section 2.3: is the unscaled
+standard deviation $\approx\sqrt{d_k}$? At which $d_k$ does the unscaled softmax become
+essentially one-hot, and what happens to the gradient there? Why does the *scaled* gradient
+also shrink with $d_k$, more slowly?
+
+### 1.3 The prefix property
+
+Section 2.4 proves that with causal masking the output at position $t$ does not depend on
+positions after $t$, and that running the model on the prefix $x_{1:t}$ gives the same
+output at $t$ as running it on the full sequence. Check it on a two-layer stack of
+attention and position-wise maps with random weights.
+
+```{python}
+#| label: prefix
+d = 32
+W = [torch.randn(d, 3 * d) / math.sqrt(d) for _ in range(2)]   # two layers of q,k,v weights
+U = [torch.randn(d, d) / math.sqrt(d) for _ in range(2)]       # two position-wise maps
+
+def stack(x, causal=True):
+    """Two layers of (attention -> residual -> position-wise tanh map -> residual)."""
+    for Wl, Ul in zip(W, U):
+        q, k, v = (x @ Wl).split(d, dim=-1)
+        x = x + attention(q, k, v, causal=causal)[0]
+        x = x + torch.tanh(x @ Ul)
+    return x
+
+x = torch.randn(10, d)
+full = stack(x)
+# TODO: for each t, run the stack on x[:t] and compare its last row with full[t-1];
+#       then repeat with causal=False and see the property fail
+# --- SOLUTION START ---
+ok = all(torch.allclose(stack(x[:t])[-1], full[t - 1], atol=1e-5) for t in range(1, 11))
+full_bi = stack(x, causal=False)
+fails = sum(not torch.allclose(stack(x[:t], causal=False)[-1], full_bi[t - 1], atol=1e-5)
+            for t in range(1, 10))
+# --- SOLUTION END ---
+print("causal: prefix property holds for all t:", ok)
+print("bidirectional: fails at", fails, "of 9 prefixes")
+assert ok and fails > 0
+```
+
+**Question 2.** This test is what justifies the KV cache (Section 3.7). In one sentence:
+which tensors of the computation above could be stored when the sequence grows from $t$
+to $t+1$, and which must be recomputed?
+
+### 1.4 What random attention looks like
+
+At initialization, patterns are close to uniform over the allowed positions, slightly
+noisy. Section 4 of the notes describes what they become after training; Section 2.4 of
+this lab (optional) looks at a trained model.
+
+```{python}
+#| label: pattern
+import matplotlib.pyplot as plt
+q, k, v = (torch.randn(12, 16) for _ in range(3))
+_, A = attention(q / 4, k / 4, v)              # /4: smaller scores, closer to init
+plt.figure(figsize=(3.2, 3)); plt.imshow(A, cmap="Blues", vmin=0, vmax=1)
+plt.xlabel("key position s"); plt.ylabel("query position t"); plt.title("A at init-like scale")
+plt.colorbar(fraction=0.046); plt.tight_layout(); plt.show()
+print("row t attends to t+1 positions with mean weight 1/(t+1):",
+      [round(1 / (t + 1), 2) for t in range(4)], "vs", [round(A[t, :t + 1].mean().item(), 2) for t in range(4)])
+```
+
+---
+
+## 2. Multi-head causal self-attention
+
+### 2.1 The module
+
+Section 2.6, in the layout of every production implementation: one `Linear(d, 3d)` for
+the queries, keys and values of all heads; a reshape to `[B, h, n, d/h]`; attention per
+head (your function from 1.1 works unchanged on that shape); reshape back; output
+projection $W_O$.
+
+```{python}
+#| label: mha
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d, n_heads):
+        super().__init__()
+        assert d % n_heads == 0
+        self.d, self.h, self.dk = d, n_heads, d // n_heads
+        self.qkv = nn.Linear(d, 3 * d)       # W_Q | W_K | W_V stacked along the output dim
+        self.proj = nn.Linear(d, d)          # W_O
+
+    def forward(self, x, return_pattern=False):   # x: [B, n, d]
+        B, n, d = x.shape
+        # TODO: project; split into q, k, v of shape [B, n, d]; view each as
+        #       [B, n, h, dk] and transpose to [B, h, n, dk]; call attention(...);
+        #       transpose back, merge heads into [B, n, d]; apply self.proj
+        # --- SOLUTION START ---
+        q, k, v = self.qkv(x).split(d, dim=-1)
+        q = q.view(B, n, self.h, self.dk).transpose(1, 2)
+        k = k.view(B, n, self.h, self.dk).transpose(1, 2)
+        v = v.view(B, n, self.h, self.dk).transpose(1, 2)
+        y, A = attention(q, k, v, causal=True)          # y: [B, h, n, dk]; A: [B, h, n, n]
+        y = y.transpose(1, 2).contiguous().view(B, n, d)
+        out = self.proj(y)
+        # --- SOLUTION END ---
+        return (out, A) if return_pattern else out
+```
+
+### 2.2 Test against `nn.MultiheadAttention`
+
+PyTorch's module stores the three projections concatenated in `in_proj_weight` of shape
+`[3d, d]`, in the order Q, K, V --- the same layout as your `qkv.weight` --- and the output
+projection in `out_proj`. Copy your weights into it and compare the outputs. Its mask
+convention is the opposite of ours: a boolean `attn_mask` with `True` where attention is
+**forbidden**.
+
+```{python}
+#| label: mha-test
+# test: identical weights -> identical outputs
+d, h, B, n = 64, 4, 2, 9
+ours = CausalSelfAttention(d, h)
+ref = nn.MultiheadAttention(d, h, batch_first=True)
+with torch.no_grad():
+    # TODO: copy qkv.weight/bias into ref.in_proj_weight/in_proj_bias and
+    #       proj.weight/bias into ref.out_proj.weight/bias
+    # --- SOLUTION START ---
+    ref.in_proj_weight.copy_(ours.qkv.weight); ref.in_proj_bias.copy_(ours.qkv.bias)
+    ref.out_proj.weight.copy_(ours.proj.weight); ref.out_proj.bias.copy_(ours.proj.bias)
+    # --- SOLUTION END ---
+x = torch.randn(B, n, d)
+forbid = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+y_ref, _ = ref(x, x, x, attn_mask=forbid, need_weights=False)
+y_ours = ours(x)
+assert torch.allclose(y_ours, y_ref, atol=1e-5), (y_ours - y_ref).abs().max()
+print("ok: max |diff| =", (y_ours - y_ref).abs().max().item())
+```
+
+### 2.3 Parameter count of attention
+
+```{python}
+#| label: mha-params
+# test: 4 d^2 weights + 4 d biases, independent of the number of heads (Section 2.6)
+for d, h in [(64, 4), (64, 8), (768, 12)]:
+    n_params = sum(p.numel() for p in CausalSelfAttention(d, h).parameters())
+    assert n_params == 4 * d * d + 4 * d, (d, h, n_params)
+print("ok")
+```
+
+### 2.4 Attention patterns of a trained model (optional, +10 min, needs internet)
+
+Load GPT-2 small through `transformers` and look at the attention matrices of layer 0
+and layer 5 on a sentence. You should find heads attending to the previous token, heads
+attending to the first token (the attention sink of Section 4), and, in later layers,
+heads whose pattern follows the content.
+
+```{python}
+#| label: gpt2-patterns
+#| eval: false
+# pip install transformers   (Colab: !pip install -q transformers)
+from transformers import GPT2TokenizerFast, GPT2LMHeadModel
+tok = GPT2TokenizerFast.from_pretrained("gpt2")
+gpt2 = GPT2LMHeadModel.from_pretrained("gpt2", attn_implementation="eager").eval()
+text = "Mr. Dursley was the director of a firm called Grunnings. Mr. Dursley"
+ids = tok(text, return_tensors="pt")
+with torch.no_grad():
+    out = gpt2(**ids, output_attentions=True)
+labels = tok.convert_ids_to_tokens(ids["input_ids"][0])
+fig, axes = plt.subplots(2, 4, figsize=(14, 7))
+for row, layer in enumerate((0, 5)):
+    for col, head in enumerate((0, 1, 2, 3)):
+        ax = axes[row, col]
+        ax.imshow(out.attentions[layer][0, head], cmap="Blues")
+        ax.set_title(f"layer {layer}, head {head}", fontsize=9)
+        ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=90, fontsize=6)
+        ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels, fontsize=6)
+plt.tight_layout(); plt.show()
+# Where does the second "Dursley" look? Which heads are previous-token heads? Which are sinks?
+```
+
+---
+
+## 3. The block and the model
+
+### 3.1 MLP and block
+
+Section 3.4: pre-norm. Fill in the two residual updates.
+
+```{python}
+#| label: block
+class MLP(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.fc = nn.Linear(d, 4 * d)        # W_1: the keys of the key-value memory
+        self.proj = nn.Linear(4 * d, d)      # W_2: the values
+
+    def forward(self, x):
+        return self.proj(F.gelu(self.fc(x)))
+
+class Block(nn.Module):
+    def __init__(self, d, n_heads):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d)
+        self.attn = CausalSelfAttention(d, n_heads)
+        self.ln2 = nn.LayerNorm(d)
+        self.mlp = MLP(d)
+
+    def forward(self, x):
+        # TODO: two pre-norm residual updates (Section 3.4)
+        # --- SOLUTION START ---
+        x = x + self.attn(self.ln1(x))       # mixes positions
+        x = x + self.mlp(self.ln2(x))        # position-wise
+        # --- SOLUTION END ---
+        return x
+```
+
+```{python}
+#| label: block-test
+# test: shape preserved; the block is causal; 12 d^2 + O(d) parameters
+d, h = 48, 4
+blk = Block(d, h)
+x = torch.randn(2, 7, d)
+y = blk(x)
+assert y.shape == x.shape
+x2 = x.clone(); x2[:, 5:] += 10.0            # perturb the future
+assert torch.allclose(blk(x2)[:, :5], y[:, :5], atol=1e-5), "block is not causal"
+n_params = sum(p.numel() for p in blk.parameters())
+assert n_params == 12 * d * d + 13 * d, n_params     # 4d^2+4d (attn) + 8d^2+5d (mlp) + 4d (two LNs)
+print("ok:", n_params, "parameters; 12 d^2 =", 12 * d * d)
+```
+
+### 3.2 The model
+
+Given in full (it is the code of Appendix B.2); read it once --- Lab 3 trains it.
+
+```{python}
+#| label: gpt
+class GPT(nn.Module):
+    def __init__(self, vocab_size, n_ctx, d, n_layers, n_heads):
+        super().__init__()
+        self.n_ctx = n_ctx
+        self.tok_emb = nn.Embedding(vocab_size, d)          # E
+        self.pos_emb = nn.Embedding(n_ctx, d)               # P
+        self.blocks = nn.ModuleList([Block(d, n_heads) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(d)
+        self.head = nn.Linear(d, vocab_size, bias=False)    # U
+        self.head.weight = self.tok_emb.weight              # weight tying
+        self.apply(self._init)
+
+    def _init(self, m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+        if isinstance(m, nn.Linear) and m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+    def forward(self, idx, targets=None):
+        B, n = idx.shape
+        pos = torch.arange(n, device=idx.device)
+        x = self.tok_emb(idx) + self.pos_emb(pos)
+        for block in self.blocks:
+            x = block(x)
+        logits = self.head(self.ln_f(x))
+        loss = None if targets is None else F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+```
+
+### 3.3 Counting parameters: the formula against the code
+
+Section 3.5: $N\approx 12Ld^2 + Vd + n_{\max}d$. GPT-2 was released in four sizes.
+Instantiate each on the `meta` device (no memory is allocated, so even the 1.5B model is
+instant) and compare the exact count with the formula and with the published figure.
+
+```{python}
+#| label: count
+GPT2 = {  # name: (d, L, h), all with V = 50257, n_ctx = 1024
+    "small":  (768, 12, 12),
+    "medium": (1024, 24, 16),
+    "large":  (1280, 36, 20),
+    "xl":     (1600, 48, 25),
+}
+PUBLISHED = {"small": 124e6, "medium": 355e6, "large": 774e6, "xl": 1558e6}
+V, n_ctx = 50257, 1024
+
+def formula(d, L):
+    # TODO: 12 L d^2 + V d + n_ctx d
+    # --- SOLUTION START ---
+    return 12 * L * d * d + V * d + n_ctx * d
+    # --- SOLUTION END ---
+
+print(f"{'model':>7} {'exact':>9} {'formula':>9} {'published':>10} {'embed %':>8}")
+for name, (d, L, h) in GPT2.items():
+    with torch.device("meta"):
+        m = GPT(V, n_ctx, d, L, h)
+    exact = sum(p.numel() for p in m.parameters())
+    f = formula(d, L)
+    assert abs(exact - f) / exact < 0.01 and abs(exact - PUBLISHED[name]) / exact < 0.01
+    print(f"{name:>7} {exact/1e6:8.1f}M {f/1e6:8.1f}M {PUBLISHED[name]/1e6:9.0f}M {100*V*d/exact:7.1f}%")
+```
+
+**Question 3.** The exact count differs from the formula by the biases and normalization
+parameters, $O(Ld)$. Write that term exactly for this architecture and check it against the
+difference printed above. Then: by what factor would the *non-embedding* count grow if you
+doubled $d$? If you doubled $L$?
+
+### 3.4 Sanity check: the loss at initialization
+
+A model that knows nothing should assign probability $\approx 1/V$ to every token, so its
+cross-entropy should be $\approx\ln V$. This is the first thing to check before training
+anything (Lab 3); a loss far above $\ln V$ at step 0 means the logits are too large at
+initialization.
+
+```{python}
+#| label: init-loss
+small = GPT(V, 128, 128, 2, 4)
+idx = torch.randint(0, V, (4, 64))
+logits, loss = small(idx[:, :-1], idx[:, 1:])
+print(f"loss at init = {loss.item():.3f}   ln V = {math.log(V):.3f}")
+assert abs(loss.item() - math.log(V)) < 0.1
+```
+
+---
+
+## 4. Time and memory versus sequence length
+
+Section 2.8: per layer, attention costs $4n^2d$ FLOPs against $24nd^2$ for everything
+else, and the naive implementation stores an $h\times n\times n$ matrix per layer for the
+backward pass. Measure it. Use GPT-2 small's width ($d = 768$, $h = 12$), batch size 1,
+and double $n$ until something breaks.
+
+### 4.1 Naive attention
+
+```{python}
+#| label: profile
+def profile(fn, x, repeats=3):
+    """Returns (seconds per forward+backward, peak memory in MB) of fn on x."""
+    if device == "cuda":
+        torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+    fn(x).sum().backward()                            # warm-up
+    if device == "cuda": torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(repeats):
+        fn(x).sum().backward()
+    if device == "cuda": torch.cuda.synchronize()
+    dt = (time.perf_counter() - t0) / repeats
+    mem = torch.cuda.max_memory_allocated() / 2**20 if device == "cuda" else float("nan")
+    return dt, mem
+
+d, h = 768, 12
+attn = CausalSelfAttention(d, h).to(device)
+lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384] if device == "cuda" else [128, 256, 512, 1024, 2048]
+naive = {}
+for n in lengths:
+    x = torch.randn(1, n, d, device=device, requires_grad=True)
+    try:
+        naive[n] = profile(attn, x)
+        print(f"n={n:6d}  {naive[n][0]*1e3:8.1f} ms  {naive[n][1]:9.0f} MB   "
+              f"A alone: {h*n*n*4/2**20:8.0f} MB (fp32)")
+    except torch.cuda.OutOfMemoryError:
+        print(f"n={n:6d}  out of memory"); torch.cuda.empty_cache(); break
+    del x
+```
+
+**Question 4.** Fit a line to $\log(\text{time})$ against $\log n$ over the upper half of
+the lengths and report the slope. Do the same for memory. Compare with the analytic size of
+the attention matrix printed in the last column: what fraction of the peak memory is it,
+and what else is being stored?
+
+### 4.2 Fused attention
+
+Replace the three lines that materialize $A$ by `F.scaled_dot_product_attention`, which
+on a GPU dispatches to FlashAttention or to a memory-efficient kernel (Section 2.8). The
+output is the same to floating-point precision; the memory is not.
+
+```{python}
+#| label: fused
+class FusedCausalSelfAttention(CausalSelfAttention):
+    def forward(self, x):
+        B, n, d = x.shape
+        q, k, v = self.qkv(x).split(d, dim=-1)
+        q, k, v = (t.view(B, n, self.h, self.dk).transpose(1, 2) for t in (q, k, v))
+        # TODO: call F.scaled_dot_product_attention with is_causal=True, merge heads, project
+        # --- SOLUTION START ---
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, n, d)
+        out = self.proj(y)
+        # --- SOLUTION END ---
+        return out
+
+fused = FusedCausalSelfAttention(d, h).to(device)
+fused.load_state_dict(attn.state_dict())
+x = torch.randn(1, 256, d, device=device)
+assert torch.allclose(fused(x), attn(x), atol=1e-4)
+
+fused_res = {}
+for n in lengths:
+    x = torch.randn(1, n, d, device=device, requires_grad=True)
+    try:
+        fused_res[n] = profile(fused, x)
+        print(f"n={n:6d}  {fused_res[n][0]*1e3:8.1f} ms  {fused_res[n][1]:9.0f} MB")
+    except torch.cuda.OutOfMemoryError:
+        print(f"n={n:6d}  out of memory"); torch.cuda.empty_cache(); break
+    del x
+```
+
+```{python}
+#| label: profile-plot
+fig, axes = plt.subplots(1, 2, figsize=(9, 3.4))
+for res, lab in ((naive, "naive"), (fused_res, "fused (SDPA)")):
+    ns = sorted(res)
+    axes[0].loglog(ns, [res[n][0] for n in ns], "o-", label=lab)
+    if device == "cuda":
+        axes[1].loglog(ns, [res[n][1] for n in ns], "o-", label=lab)
+ns = sorted(naive)
+axes[0].loglog(ns, [naive[ns[0]][0] * (n / ns[0]) ** 2 for n in ns], "k:", label="$n^2$ reference")
+axes[0].set_xlabel("n"); axes[0].set_ylabel("s / fwd+bwd"); axes[0].legend()
+axes[1].set_xlabel("n"); axes[1].set_ylabel("peak MB (GPU only)")
+if device == "cuda": axes[1].legend()
+plt.tight_layout(); plt.show()
+```
+
+**Question 5.** Where does the fused kernel's memory curve bend, and why does its *time*
+still grow like $n^2$? Up to which $n$ can you train GPT-2 small's attention on this GPU
+with each implementation?
+
+### 4.3 Attention versus the rest of the block
+
+Section 2.8 predicts that the $n^2$ term equals the linear term at $n = 6d$. Time the
+attention core alone (scores, softmax, $AV$) against the projections plus the MLP, and
+compare the measured ratio with $n/(6d)$. Use a smaller width so that the crossover is
+within reach: $d = 256$, so $6d = 1536$.
+
+```{python}
+#| label: crossover
+d_small, h_small = 256, 4
+blk = Block(d_small, h_small).to(device)
+
+def time_it(fn, repeats=5):
+    if device == "cuda": torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(repeats):
+        fn()
+    if device == "cuda": torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / repeats
+
+print(f"{'n':>6} {'core ms':>9} {'rest ms':>9} {'measured':>9} {'n/(6d)':>8}")
+with torch.no_grad():
+    for n in [256, 512, 1024, 2048, 4096]:
+        x = torch.randn(1, n, d_small, device=device)
+        q, k, v = blk.attn.qkv(x).split(d_small, dim=-1)
+        q, k, v = (t.view(1, n, h_small, -1).transpose(1, 2) for t in (q, k, v))
+        # TODO: core = attention(q, k, v); rest = qkv projection + output projection + MLP
+        # --- SOLUTION START ---
+        core = time_it(lambda: attention(q, k, v))
+        rest = time_it(lambda: blk.mlp(blk.attn.proj(blk.attn.qkv(x)[..., :d_small])))
+        # --- SOLUTION END ---
+        print(f"{n:6d} {core*1e3:9.2f} {rest*1e3:9.2f} {core/rest:9.2f} {n/(6*d_small):8.2f}")
+```
+
+**Question 6.** The measured ratio will not match $n/(6d)$ exactly. List two reasons on the
+side of the measurement (what else the "core" does besides the two matrix products; how
+well each operation uses the hardware) and say in which direction each one biases the
+ratio.
+
+---
+
+## 5. Report
+
+| | $n$ = 512 | 1024 | 2048 | 4096 | 8192 | largest $n$ that fits |
+|---|---|---|---|---|---|---|
+| naive: ms / fwd+bwd | | | | | | |
+| naive: peak MB | | | | | | |
+| fused: ms / fwd+bwd | | | | | | |
+| fused: peak MB | | | | | | |
+
+GPU used: ______. Slope of $\log$ time vs. $\log n$ (naive): ______; (fused): ______.
+
+**Question 7 (closing).** In one paragraph: Lab 3 will train a model with $d = 256$,
+$L = 6$ on sequences of $n = 256$ tokens. Using today's measurements and the counts of
+Section 3.5, estimate what fraction of its training time will be spent in attention, and
+whether the fused kernel matters at that scale. Then say at what $n$ it would start to.
+
+```{python}
+#| label: save
+results = {"device": device, "naive": {str(k): v for k, v in naive.items()},
+           "fused": {str(k): v for k, v in fused_res.items()}}
+import pathlib; pathlib.Path("data").mkdir(exist_ok=True)
+pathlib.Path("data/lab2_profile.json").write_text(json.dumps(results, indent=1))
+print(json.dumps(results, indent=1)[:400], "...")
+```
+
+---
+
+## Written exercises
+
+Exercises 1–8 of the lecture notes (Section "Exercises") are due with this notebook.
+Exercise 1 (scaling) and Exercise 2 (softmax Jacobian) are checked numerically by
+Section 1.2 above; Exercise 5 (parameter counts) by Section 3.3; Exercise 7 (memory of the
+attention matrices) by Section 4.1 --- quote your measurements in the written answers.

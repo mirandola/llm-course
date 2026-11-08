@@ -6,8 +6,10 @@ execute:
   enabled: false
 ---
 
+<!-- page-only -->
 [![Open the student notebook in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mirandola/llm-course/blob/main/labs/M1P2_lab1_student.ipynb)
 This page shows the lab with solutions; students work in the notebook.
+<!-- /page-only -->
 
 
 ## What you will build

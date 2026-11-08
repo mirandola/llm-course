@@ -34,12 +34,16 @@ website:
         - section: "Module 1 — Language modeling and tokenization"
           contents:
             - notes/M1P1.qmd
+        - section: "Module 2 — The Transformer architecture"
+          contents:
+            - notes/M2P1.qmd
     - id: labs
       title: "Labs"
       style: docked
       contents:
         - labs/index.qmd
         - labs/lab1.qmd
+        - labs/lab2.qmd
   page-footer:
     left: "Heudson Mirandola · Instituto de Matemática, UFRJ"
     right: "Built with Quarto"

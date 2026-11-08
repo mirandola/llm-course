@@ -19,7 +19,7 @@ Published at <https://mirandola.github.io/llm-course>.
 ```bash
 quarto preview                      # live preview of the site
 quarto render                       # builds _site/
-python tools/make_lab_versions.py labs/lab1.qmd    # regenerates the notebooks
+python tools/make_lab_versions.py labs/lab2.qmd M2P2_lab2   # regenerates the two notebooks
 ```
 
 Slides are compiled with `pdflatex` (twice) and the PDF committed next to the source.

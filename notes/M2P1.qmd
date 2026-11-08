@@ -1,0 +1,520 @@
+---
+title: "Embeddings, attention and the Transformer block"
+subtitle: "Module 2 · Lecture 1 (M2P1) · Week 2"
+author: "Heudson Mirandola"
+date: "2026-11-03"
+number-sections: true
+---
+
+# Introduction {#introduction .unnumbered}
+
+Week 1 ended with two structural defects of the $n$-gram model: it cannot share statistical strength between symbols that behave alike, and it cannot look further back than a fixed, short window. This lecture builds the neural language model that answers both, one component at a time, and ends with the complete decoder-only Transformer --- the architecture of every model the course will touch from now on.
+
+One idea organizes everything that follows:
+
+> **A Transformer is a stack of two alternating operations: one that mixes information *across positions* (attention) and one that processes *each position on its own* (the MLP). Attention is the only place where positions talk to each other, and it is nothing more than a weighted average with data-dependent weights.**
+
+Section 1 introduces the embedding matrix and Bengio's neural language model, which solves the first defect but keeps a fixed window. Section 2 derives attention from the requirement that a model aggregate a history of *variable* length with a *fixed* number of parameters, and works out its four design decisions: the query--key--value factorization, the $\sqrt{d_k}$ scaling, the causal mask and multiple heads. Section 3 assembles the block --- residual connections, normalization, the MLP --- counts its parameters and its floating-point operations, and explains why training it is embarrassingly parallel while generating from it is not.
+
+**Prerequisites.** Linear algebra (matrix products, rank, orthogonal matrices); multivariable calculus (Jacobians, chain rule); the softmax function and the cross-entropy loss from Week 1; neural networks at the level of backpropagation through an MLP.
+
+**Conventions.** Vectors are columns; $x^{\top}y$ is the dot product. A sequence of $n$ vectors $h_1,\dots,h_n\in\mathbb{R}^d$ is stacked as the **rows** of a matrix $H\in\mathbb{R}^{n\times d}$, which is PyTorch's convention (`[batch, seq, dim]`), so linear maps act on the right: $HW$. $\mathrm{softmax}(z)_i = e^{z_i}/\sum_j e^{z_j}$; applied to a matrix, softmax acts on each row. $d$ is the model width, $n$ the sequence length, $V$ the vocabulary size, $L$ the number of layers.
+
+# From counts to vectors: embeddings
+
+## One-hot vectors and the embedding matrix
+
+Week 1 represented a token as an integer in $\{1,\dots,V\}$. A neural network needs a vector. The trivial vectorization is the **one-hot** vector $e_v\in\mathbb{R}^V$, with a 1 in position $v$ and zeros elsewhere. It is useless as a representation --- all tokens are at the same distance from each other, $\|e_v-e_w\|^2 = 2$ for $v\neq w$ --- but it is the right starting point, because a linear map applied to it *selects a row*.
+
+Fix $d\ll V$ and a matrix $E\in\mathbb{R}^{V\times d}$, the **embedding matrix**. The embedding of token $v$ is $$x_v \;=\; E^{\top}e_v \;=\; \text{row } v \text{ of } E \;\in\mathbb{R}^d .$$
+
+That is all an embedding layer is: a lookup table with $V$ rows of length $d$, trained by gradient descent like any other weight. Writing it as a matrix product with a one-hot vector matters for one reason: it shows that the lookup is a *linear* operation, so backpropagation through it is just "add the gradient to the row that was used". `nn.Embedding` in PyTorch is exactly this table, with the matrix product replaced by indexing.
+
+Typical sizes: GPT-2 has $V = 50{,}257$ and $d = 768$ (smallest model) to $1600$ (largest); Llama 3 has $V = 128{,}256$ and $d = 4096$ to $16384$. The embedding matrix alone has $Vd$ parameters --- 38.6 million for GPT-2 small, about 30% of the model (Section 3.6).
+
+## Bengio's neural language model
+
+The first neural language model to work at scale (Bengio, Ducharme, Vincent and Jauvin, 2003) is the direct neural translation of the $n$-gram. It keeps the Markov assumption --- the next token depends on the previous $n-1$ --- and replaces the count table by a function of the embeddings: $$p_\theta(x_t\mid x_{t-n+1},\dots,x_{t-1}) \;=\; \mathrm{softmax}\!\big(U\,\sigma(W c_t + b) + b'\big)_{x_t},
+\qquad c_t = \big[x_{t-n+1};\,\dots;\,x_{t-1}\big]\in\mathbb{R}^{(n-1)d},$$ where $c_t$ is the concatenation of the $n-1$ embeddings, $\sigma$ is an elementwise nonlinearity ($\tanh$ in the paper), $W\in\mathbb{R}^{m\times(n-1)d}$ and $U\in\mathbb{R}^{V\times m}$.
+
+Two things change relative to the $n$-gram, and they are worth separating.
+
+**Parameter count.** A trigram table has up to $V^3$ entries; the neural model has $Vd + m(n-1)d + Vm$ parameters --- *linear* in $V$ and in $n$. For $V = 20{,}000$, $d = 100$, $m = 500$, $n = 5$: 2 million + 200 thousand + 10 million, against $V^5 = 3.2\times 10^{21}$ cells of which the corpus can fill a negligible fraction.
+
+**Sharing.** This is the point. In the count table, the histories "o gato dorme" and "o cão dorme" are unrelated keys; what the corpus says about one says nothing about the other. In the neural model both histories are mapped to nearby points of $\mathbb{R}^{(n-1)d}$ *if* the embeddings of `gato` and `cão` are nearby, and a smooth function of $c_t$ then gives similar predictions. The model is forced to learn embeddings with that property because it is the only way to fit the data with few parameters. Bengio's paper reported a 24% perplexity reduction over the best smoothed $n$-gram on the Brown corpus (8% on a larger news corpus), and, unlike count-based models, whose sparsity worsens with $n$, the neural model kept improving when given a longer window.
+
+> **Defect 1 of the $n$-gram is solved.** Not by a cleverer smoothing, but by changing the representation of the history from a discrete key to a point in a vector space, where "similar" has a meaning the model can exploit.
+
+Defect 2 --- the fixed window --- is untouched: $c_t$ has fixed length $(n-1)d$, so the model cannot condition on anything older than $n-1$ tokens. Section 2 is about removing that constraint.
+
+## The output layer and weight tying
+
+The last two operations of the model above --- multiply by $U\in\mathbb{R}^{V\times m}$ and apply softmax --- appear unchanged in every neural language model, including the Transformer. The vector $z = Uh\in\mathbb{R}^V$ is called the **logits**; $U$ is the **unembedding** (or output embedding, or language-model head). Row $w$ of $U$ is a vector $u_w\in\mathbb{R}^m$, and $z_w = u_w^{\top}h$ is a dot product: the model scores each candidate token by how well its output vector aligns with the hidden state. Training with cross-entropy, the gradient of the loss with respect to the logits is $$\frac{\partial \ell}{\partial z} \;=\; p_\theta(\cdot\mid h) - e_{y},$$ the predicted distribution minus the one-hot target (Appendix A.1). Every parameter of the network receives its gradient through this vector. Read it as: push the logit of the correct token up, push the others down in proportion to how much probability they currently take.
+
+When $m = d$, the input embedding $E\in\mathbb{R}^{V\times d}$ and the unembedding $U\in\mathbb{R}^{V\times d}$ have the same shape and the same interpretation --- a vector per token --- and one can set $U = E$. This is **weight tying** (Press and Wolf, 2017; Inan et al., 2017). It saves $Vd$ parameters (30% of GPT-2 small) and acts as a regularizer; GPT-2 ties; large Llama-class models do not, because at their scale the saving is negligible and untied weights fit slightly better, while their small variants (1--3B), where the embedding is a large share, tie again. The lab's GPT (Lab 3) will tie.
+
+## The geometry of embeddings
+
+What does the trained $E$ look like? The dot product $x_v^{\top}x_w$ and the cosine $x_v^{\top}x_w/\|x_v\|\|x_w\|$ are the natural notions of similarity, because that is what the downstream linear maps "see". Trained embeddings put together tokens that occur in similar contexts --- the distributional hypothesis of Harris (1954) and Firth (1957), "you shall know a word by the company it keeps", realized as a geometric fact.
+
+**Static embeddings.** word2vec (Mikolov et al., 2013) and GloVe (Pennington et al., 2014) train a table $E$ *as the end product*, with a cheap surrogate objective (predict neighbors in a window) instead of a full language model. The resulting vectors have the famous additive structure, $x_{\text{king}} - x_{\text{man}} + x_{\text{woman}}\approx x_{\text{queen}}$, which can be explained from the training objective (Levy and Goldberg, 2014, show that skip-gram with negative sampling factorizes a shifted pointwise-mutual-information matrix). They are *static*: one vector per token, regardless of context, so `banco` (bench) and `banco` (bank) collapse to one point.
+
+**Contextual embeddings.** In a deep language model, the embedding $x_t$ is only the input of the first layer. The vector that the network computes at position $t$ in layer $l$, $h^{(l)}_t$, depends on the whole prefix (or on the whole sentence, in encoder models), and *that* is the representation of the token in context --- a different vector for each occurrence. This is what the syllabus calls "contextual embeddings" and what BERT-style models (Week 3, Week 6) export for downstream tasks. The remainder of the lecture is about how $h^{(l)}_t$ is computed.
+
+## The remaining problem
+
+We want to replace the fixed-length context $c_t$ by something that takes the *entire* prefix $x_1,\dots,x_{t-1}$, of variable length, and produces a fixed-size summary $h_t\in\mathbb{R}^d$, under three requirements:
+
+1.  The number of parameters must not depend on $t$ (otherwise we are back to a lookup table over histories).
+2.  The computation for all positions $t = 1,\dots,n$ must be parallelizable (otherwise training on billions of tokens is impractical --- this is what killed recurrent networks, Section 3.7).
+3.  The summary must be able to retrieve *specific* information from *specific* past positions, not just a blurred average (this is what makes copying, agreement and reference possible).
+
+Attention satisfies the three.
+
+# Attention
+
+## Averaging as a starting point
+
+The simplest fixed-size summary of a variable-length set of vectors $v_1,\dots,v_t$ is their mean, $h_t = \frac1t\sum_{s\le t} v_s$. It has no parameters, it is trivially parallel, and it is useless for language: it treats all past positions alike. The next-simplest summary is a **weighted** average, $$h_t \;=\; \sum_{s=1}^{t} a_{ts}\,v_s, \qquad a_{ts}\ge 0,\quad \sum_{s=1}^{t} a_{ts} = 1,$$ where the weights depend on the data. The whole of attention is a choice of how to compute the weights $a_{ts}$ --- the **attention pattern** of position $t$ --- from the vectors themselves.
+
+The natural choice: let the weight that position $t$ gives to position $s$ depend on how *relevant* $s$ is to $t$, measured by a score $\mathrm{score}(h_t, h_s)\in\mathbb{R}$, and normalize with a softmax so that the weights form a distribution: $$a_{ts} = \frac{\exp\mathrm{score}(h_t,h_s)}{\sum_{s'\le t}\exp\mathrm{score}(h_t,h_{s'})} .$$ The softmax does two jobs: it makes the weights positive and normalized, and --- because $\exp$ amplifies differences --- it can concentrate almost all weight on one position when one score dominates, which is requirement 3 above (retrieve a specific position), while remaining differentiable, unlike a hard $\arg\max$.
+
+## Queries, keys and values
+
+The score function in the original Transformer (Vaswani et al., 2017) is a dot product between two *linear projections* of the vectors: $$q_t = W_Q^{\top}h_t,\qquad k_s = W_K^{\top}h_s,\qquad \mathrm{score}(h_t,h_s) = \frac{q_t^{\top}k_s}{\sqrt{d_k}},$$ with $W_Q, W_K\in\mathbb{R}^{d\times d_k}$. The vector $q_t$ is the **query** of position $t$ --- what it is looking for --- and $k_s$ is the **key** of position $s$ --- what it offers. The vector that is actually averaged is a third projection, the **value** $v_s = W_V^{\top}h_s$ with $W_V\in\mathbb{R}^{d\times d_v}$.
+
+Three questions a careful reader should ask.
+
+*Why not use $h_t^{\top}h_s$ directly?* Because the dot product is symmetric and the relation "$s$ is relevant to $t$" is not: a verb looks for its subject, but a subject does not look for its verb in the same way. With separate $W_Q$ and $W_K$ the score is $h_t^{\top}(W_QW_K^{\top})h_s$, a general bilinear form with a matrix $W_QW_K^{\top}\in\mathbb{R}^{d\times d}$ of rank at most $d_k$. The factorization into $W_Q$ and $W_K$ is a low-rank parametrization of that bilinear form; it costs $2dd_k$ parameters instead of $d^2$.
+
+*Why separate values from keys?* Because *what makes a position worth attending to* and *what it contributes once attended* are different pieces of information. A key may encode "I am a noun in subject position"; the value it carries may be "I am plural". Tying $v_s = k_s$ is possible and is occasionally done, but it halves the model's freedom for no saving that matters.
+
+*Why the dot product and not an MLP on $(h_t, h_s)$?* Earlier attention mechanisms (Bahdanau et al., 2015) used a small MLP, $\mathrm{score} = w^{\top}\tanh(W_1h_t + W_2h_s)$. The dot product is chosen because, for all $t$ and $s$ at once, it is one matrix product --- $QK^{\top}$ --- which is the single most optimized operation on a GPU. Requirement 2 (parallelism) decides it.
+
+**The soft-dictionary reading.** A Python dictionary maps a query to the value whose key matches it exactly. Attention maps a query to a *convex combination* of all values, weighted by how well each key matches, with "match" meaning dot product. If one key matches far better than the others, the softmax makes the combination nearly a hard lookup; if several match equally, it returns their average. Everything attention can do is a differentiable, parallel, associative memory lookup.
+
+## The $\sqrt{d_k}$ scaling
+
+The division by $\sqrt{d_k}$ looks like a detail. It is not; without it, training a wide model fails. The reason is a one-line variance calculation.
+
+::: {.statement}
+**Proposition (scale of dot products).** Let $q,k\in\mathbb{R}^{d_k}$ have independent components with mean 0 and variance 1. Then $\mathbb{E}[q^{\top}k] = 0$ and $\operatorname{Var}[q^{\top}k] = d_k$.
+:::
+
+::: {.argument}
+*Proof.* $q^{\top}k = \sum_{i=1}^{d_k} q_ik_i$. Each term has mean $\mathbb{E}[q_i]\mathbb{E}[k_i] = 0$ and variance $\mathbb{E}[q_i^2k_i^2] = \mathbb{E}[q_i^2]\mathbb{E}[k_i^2] = 1$ by independence. The $d_k$ terms are independent, so the variance of the sum is the sum of the variances, $d_k$. $\square$
+:::
+
+At initialization, with the usual weight scalings, the entries of $q$ and $k$ are approximately of unit scale, so the raw scores $q_t^{\top}k_s$ have standard deviation $\sqrt{d_k}$ --- about 8 for $d_k = 64$, 32 for $d_k = 1024$. Softmax of a vector whose entries differ by tens is essentially a one-hot vector. That is bad for two reasons. First, at initialization the model should not already have strong opinions about which position to attend to. Second, and decisively, *a saturated softmax has vanishing gradient*: the Jacobian of the softmax is $$\frac{\partial a_i}{\partial s_j} \;=\; a_i\,(\delta_{ij} - a_j),$$ (Appendix A.2), and if $a_i\approx 1$ for one $i$ and $\approx 0$ for the rest, every entry of the Jacobian is $\approx 0$ --- the gradient cannot flow back through the scores to $W_Q$ and $W_K$, and the attention pattern never changes from its random initial state. Dividing by $\sqrt{d_k}$ brings the scores back to unit variance, where the softmax is in its responsive regime.
+
+The lesson generalizes: in deep networks, the *scale* of every intermediate quantity has to be controlled, by normalization layers (Section 3.3), by initialization, or by explicit constants like this one. Module 3 returns to the theme when diagnosing training instabilities.
+
+## The causal mask
+
+In a language model, position $t$ must not see positions $s > t$: the output at $t$ is the prediction of $x_{t+1}$, and if the model could read $x_{t+1}$ it would learn to copy it and the loss would go to zero without learning anything. The constraint is imposed by **masking**: before the softmax, the scores of forbidden positions are set to $-\infty$, $$\tilde s_{ts} = \begin{cases} s_{ts} & s\le t,\\ -\infty & s > t,\end{cases}
+\qquad a_{ts} = \mathrm{softmax}(\tilde s_{t,\cdot})_s,$$ so that $e^{-\infty} = 0$ removes them from both the numerator and the denominator. The result is exactly the sum over $s\le t$ written in Section 2.1, computed in a form where all positions are processed at once by a single matrix operation. In code, the mask is a lower-triangular matrix of ones, and $-\infty$ is a large negative float.
+
+The mask is what makes a single forward pass compute all $n$ conditional distributions of the sequence at once --- **teacher forcing** --- which is the training procedure of every autoregressive model. It is worth being precise about what the mask guarantees.
+
+::: {.statement}
+**Proposition (prefix property).** Consider a network built from (i) position-wise maps $h_t\mapsto f(h_t)$ applied independently to each position, and (ii) causally masked attention layers. Then the output at position $t$ is a function of $x_1,\dots,x_t$ only. Consequently, the output at position $t$ when the network is run on $x_{1:n}$ equals its output at position $t$ when run on the prefix $x_{1:t}$ alone.
+:::
+
+::: {.argument}
+*Proof.* By induction on the layers. Embeddings depend on $x_t$ only. A position-wise map preserves the property trivially. In a masked attention layer, the output at $t$ is $\sum_{s\le t}a_{ts}v_s$ where $a_{ts}$ depends on $q_t$ and $k_1,\dots,k_t$, and $q_t, k_s, v_s$ are position-wise functions of the inputs at $t$ and $s\le t$; by the induction hypothesis those inputs depend on $x_{1:t}$ only. For the second claim: the computation at position $t$ never reads anything at positions $>t$, so truncating the sequence after $t$ changes nothing. $\square$
+:::
+
+The second claim is more useful than it looks: it is what makes **generation** consistent with training (the model, fed its own prefix, computes exactly the distributions it was trained to compute), and it is what makes the **KV cache** (Module 7) valid --- keys and values of past positions can be stored and reused, because they will not change as the sequence grows.
+
+Attention without a mask, where every position sees every other, is **bidirectional**; it is what encoder models (BERT) use, and what the encoder of a translation model uses. Attention where the queries come from one sequence and the keys and values from another is **cross-attention**. Week 3 discusses the three in the context of the three model families; this lecture is about the causal case.
+
+## Matrix form
+
+Stack the $n$ input vectors as rows of $H\in\mathbb{R}^{n\times d}$. Then $$Q = HW_Q\in\mathbb{R}^{n\times d_k},\qquad K = HW_K\in\mathbb{R}^{n\times d_k},\qquad V = HW_V\in\mathbb{R}^{n\times d_v},$$ $$\boxed{\;\mathrm{Attention}(Q,K,V) \;=\; \mathrm{softmax}\!\Big(\frac{QK^{\top}}{\sqrt{d_k}} + M\Big)\,V \;\in\mathbb{R}^{n\times d_v},\;}$$ where $M\in\mathbb{R}^{n\times n}$ has $M_{ts} = 0$ for $s\le t$ and $-\infty$ otherwise, and the softmax is taken along each row. Row $t$ of the result is $h_t$'s new representation. The matrix $A = \mathrm{softmax}(QK^{\top}/\sqrt{d_k}+M)\in\mathbb{R}^{n\times n}$ is the **attention matrix**: row $t$ is the attention pattern of position $t$, a probability distribution over $\{1,\dots,t\}$. It is lower triangular, with each row summing to 1.
+
+Shapes are worth internalizing because every bug in Lab 2 will be a shape bug: $(n\times d)(d\times d_k) = n\times d_k$ for the projections; $(n\times d_k)(d_k\times n) = n\times n$ for the scores; $(n\times n)(n\times d_v) = n\times d_v$ for the output. With a batch dimension $B$ in front of everything, PyTorch broadcasts the matrix products over it.
+
+## Multi-head attention
+
+One attention layer produces, for each position, *one* distribution over the past --- one pattern. A position may need to look at several things at once: the previous token, the subject of the sentence, an open bracket. A single softmax cannot concentrate on two positions without blurring both.
+
+The fix is to run $h$ attention operations in parallel, each with its own projections and a reduced dimension $d_k = d_v = d/h$, and concatenate: $$\mathrm{head}_i = \mathrm{Attention}(HW_Q^{(i)}, HW_K^{(i)}, HW_V^{(i)}),\qquad
+\mathrm{MHA}(H) = \big[\mathrm{head}_1\,\big|\,\cdots\,\big|\,\mathrm{head}_h\big]\,W_O,$$ with $W_Q^{(i)},W_K^{(i)},W_V^{(i)}\in\mathbb{R}^{d\times d/h}$ and $W_O\in\mathbb{R}^{d\times d}$. Each **head** has its own attention matrix $A^{(i)}\in\mathbb{R}^{n\times n}$ and its own subspace of dimension $d/h$ to read from and write to; the output projection $W_O$ mixes the heads back into the residual stream.
+
+Two facts about the parameter count. First, the $h$ heads' projections stacked side by side form matrices $W_Q = [W_Q^{(1)}|\cdots|W_Q^{(h)}]\in\mathbb{R}^{d\times d}$, and similarly for $K$ and $V$, so in code the heads are computed by *one* $d\times d$ matrix product followed by a reshape --- never by a loop over heads. Second, counting: $$\#\text{params}(\mathrm{MHA}) = \underbrace{3d^2}_{W_Q,W_K,W_V} + \underbrace{d^2}_{W_O} = 4d^2$$ (plus $4d$ biases if used), *independent of the number of heads*. The number of heads trades the dimension of each head against the number of patterns; GPT-2 small uses $h = 12$ with $d/h = 64$, GPT-3 uses $d/h = 128$, Llama 3 uses $d/h = 128$ at every scale. The per-head dimension is kept roughly constant across model sizes and the number of heads grows with $d$.
+
+**Grouped-query attention**, where several query heads share one key--value head, is Week 3's topic; it reduces the KV cache, not the parameter count, and is motivated by inference, not by training.
+
+## What attention does not know: position
+
+::: {.statement}
+**Proposition (permutation equivariance).** Let $P\in\mathbb{R}^{n\times n}$ be a permutation matrix and let $\mathrm{Attention}$ be unmasked attention with the projections $W_Q,W_K,W_V$. Then $\mathrm{Attention}(PH) = P\,\mathrm{Attention}(H)$.
+:::
+
+::: {.argument}
+*Proof.* Writing $Q = HW_Q$ etc., the permuted input gives $Q' = PQ$, $K' = PK$, $V' = PV$. The scores are $S' = Q'K'^{\top} = PSP^{\top}$ --- rows and columns permuted together. Row-wise softmax commutes with a simultaneous permutation of rows and columns, because permuting the entries within a row does not change its softmax values, only their order: $\mathrm{softmax}(PSP^{\top}) = P\,\mathrm{softmax}(S)\,P^{\top}$. Then $A'V' = PAP^{\top}PV = PAV$, since $P^{\top}P = I$. $\square$
+:::
+
+The same holds for every position-wise map, so a whole unmasked Transformer without positional information is permutation-equivariant: it processes a *set* of tokens, not a sequence. "O gato mordeu o cão" and "o cão mordeu o gato" would produce the same set of output vectors, permuted. Something has to break the symmetry.
+
+**Learned absolute positions.** GPT-2 and BERT add a second lookup table $P\in\mathbb{R}^{n_{\max}\times d}$ and feed $x_t + p_t$ to the first layer. It is simple and works; its cost is that the model cannot process sequences longer than $n_{\max}$ (there is no row $p_{n_{\max}+1}$), and that it has to learn separately, for each pair of positions, how far apart they are.
+
+**Sinusoidal positions.** The original Transformer used a fixed table $$p_{t,2i} = \sin\!\big(\omega_i t\big),\qquad p_{t,2i+1} = \cos\!\big(\omega_i t\big),\qquad \omega_i = 10000^{-2i/d},\quad i = 0,\dots,d/2-1,$$ a bank of $d/2$ sinusoids of geometrically spaced frequencies, from wavelength $2\pi$ to $2\pi\cdot 10000$. The choice is motivated by a property that learned tables do not have: for every frequency $\omega_i$ and every offset $k$, $$\begin{pmatrix} \sin\omega_i(t+k)\\ \cos\omega_i(t+k)\end{pmatrix} = \begin{pmatrix}\cos\omega_ik & \sin\omega_ik\\ -\sin\omega_ik & \cos\omega_ik\end{pmatrix}\begin{pmatrix}\sin\omega_it\\ \cos\omega_it\end{pmatrix},$$ a rotation by the angle $\omega_ik$ that *does not depend on $t$* (Appendix A.3). The position $t+k$ is a fixed linear function of the position $t$, so a linear layer can in principle learn to express "the token $k$ positions back" uniformly for all $t$. In practice the property is weakened by the fact that the positions are *added* to the embeddings and then multiplied by $W_Q$ and $W_K$: the dot product $q_t^{\top}k_s$ contains cross terms between content and position. **Rotary position embeddings** (RoPE, Week 3) take the idea to its conclusion: apply the rotation to $q$ and $k$ themselves, so that $q_t^{\top}k_s$ depends on $t-s$ exactly. The two-by-two rotation above is literally the building block of RoPE.
+
+*Remark.* With the causal mask, the symmetry is already partially broken: position $t$ sees $t$ keys, position $t'$ sees $t'$ keys, and the model can infer position from, for instance, how diluted the average is. Haviv et al. (2022) show that decoder-only models with no positional encoding at all learn competitive language models. Positional encodings are nevertheless universal because they make position *easy* to use, not because they make it possible.
+
+## The cost of attention
+
+Attention is the only part of the Transformer whose cost grows faster than linearly in the sequence length. The two matrix products of Section 2.5 cost, per head, $n\cdot n\cdot d_k$ multiply-adds each; summing over the $h$ heads with $hd_k = d$: $$\text{FLOPs}(QK^{\top}) + \text{FLOPs}(AV) \;\approx\; 2\cdot n^2d + 2\cdot n^2 d \;=\; 4n^2d$$ (a multiply-add is two floating-point operations). The four projections cost $2\cdot n\cdot 4d^2 = 8nd^2$. The MLP of the block (Section 3.4) costs $16nd^2$. Per layer, therefore, $$\text{FLOPs per layer} \;\approx\; 24\,nd^2 \;+\; 4\,n^2d,$$ and the quadratic term dominates the linear one when $4n^2d > 24nd^2$, that is, when $$n \;>\; 6d .$$ For GPT-2 small ($d = 768$) the crossover is at $n\approx 4600$, beyond its context of 1024; attention's $n^2$ term is then about a fifth of the total. For a model with $d = 4096$ the crossover is at $n\approx 25{,}000$. The frequent statement that "attention is quadratic and therefore dominates" is false for short contexts and true for long ones; where the crossover lies depends on the width.
+
+**Memory is the more immediate problem.** A naive implementation materializes the attention matrix $A\in\mathbb{R}^{h\times n\times n}$ for each layer and each sequence in the batch, and keeps it for the backward pass. For $h = 12$, $n = 1024$ in 32-bit floats that is $12\cdot 1024^2\cdot 4\,\text{B} = 48\,\text{MB}$ per layer per sequence; for $n = 8192$ it is 3 GB per layer per sequence, more than the parameters of the whole model. Lab 2 measures this growth. **FlashAttention** (Dao et al., 2022; Week 4) computes exactly the same output without ever materializing $A$, by tiling the computation so that each block of the softmax is normalized on the fly; it does not change the $O(n^2)$ *time*, but it removes the $O(n^2)$ *memory* and, by avoiding the round trip to GPU memory, makes the time much shorter in practice.
+
+> **Hook for Modules 3 and 7.** The $4n^2d$ term is the training cost of attention. At inference, with a KV cache, generating one new token costs $O(nd)$ in attention --- one query against $n$ stored keys --- and the problem becomes the *memory* of the cache, $2\cdot L\cdot n\cdot d$ numbers per sequence. Week 10 does that arithmetic; Week 3 shows how GQA shrinks it.
+
+# The Transformer block
+
+Attention mixes positions. Everything else in the Transformer processes each position independently --- and most of the parameters and most of the computation are in that "everything else". The block has four components; this section takes them in the order in which they were understood, not the order in which they appear in the code.
+
+## The residual stream
+
+Each component $f$ of the network is applied as $$h \;\leftarrow\; h + f(h),$$ not as $h\leftarrow f(h)$. This is the **residual connection** (He et al., 2016), and it changes how one should think about the network. Unrolling over the $2L$ sublayers (attention and MLP in each of $L$ blocks), $$h^{(\text{out})}_t \;=\; x_t + p_t + \sum_{l=1}^{2L} f_l\big(h^{(l-1)}\big)_t .$$ The vector at position $t$ is a running sum --- the **residual stream** --- to which every sublayer *adds* a contribution. No sublayer transforms the stream; each one reads from it (through its input projections) and writes into it (through its output projection). The final output is the embedding plus everything every layer chose to add.
+
+Why it matters, in two ways. *Optimization:* the Jacobian of $h\mapsto h+f(h)$ is $I + \partial f/\partial h$, so the gradient of the loss with respect to any early layer contains a term that passes through all the identities, undamped, regardless of how badly conditioned the $f_l$ are. Networks of this depth were not trainable before residual connections. *Interpretation:* because the stream is a sum, one can ask what each sublayer added, and in particular which direction of the final vector --- which logit, via the unembedding --- each attention head or MLP pushed. Section 4 uses this.
+
+A consequence worth noting: the residual stream has a fixed width $d$ throughout the network. Every component must read from and write to the same $d$-dimensional space; the attention projections $W_O$ and the MLP output matrix exist precisely to map back into it.
+
+## Layer normalization
+
+The sum in the residual stream grows with depth, and the scale of each sublayer's input must be controlled (Section 2.3 showed why for attention's scores). **Layer normalization** (Ba, Kiros and Hinton, 2016) standardizes each position's vector across its $d$ coordinates: $$\mathrm{LN}(h) \;=\; \gamma\odot\frac{h-\mu}{\sqrt{\sigma^2+\epsilon}} + \beta,\qquad \mu = \frac1d\sum_{i=1}^d h_i,\quad \sigma^2 = \frac1d\sum_{i=1}^d (h_i-\mu)^2,$$ with learned $\gamma,\beta\in\mathbb{R}^d$ and a small $\epsilon$ for numerical safety. The statistics are computed *per token*, over the feature dimension, which makes LN independent of the batch and of the sequence length --- unlike batch normalization, which is why LN is what sequence models use.
+
+LN is invariant to the scale of its input: $\mathrm{LN}(\alpha h) = \mathrm{LN}(h)$ for $\alpha > 0$ (up to $\epsilon$). So whatever magnitude the residual stream reaches, each sublayer sees an input of controlled size, and the gradient with respect to the stream scales as $1/\|h-\mu\|$ (Appendix A.4) --- larger activations receive smaller gradients, a self-stabilizing effect.
+
+**Where to put it.** The original Transformer applied LN *after* the residual addition, $h\leftarrow\mathrm{LN}(h + f(h))$ (**post-norm**). GPT-2 and everything since apply it *before* the sublayer, on the branch, $h\leftarrow h + f(\mathrm{LN}(h))$ (**pre-norm**). The difference looks cosmetic and is not: in post-norm the residual stream itself is normalized at every layer, so the identity path from input to output is interrupted $2L$ times; in pre-norm the stream is a clean sum and the identity path is unbroken. Xiong et al. (2020) show that post-norm needs a learning-rate warmup to train at all and pre-norm does not; Week 3 discusses this and the RMSNorm variant (drop $\mu$ and $\beta$, normalize by the root mean square alone), which is what Llama-class models use. In these notes and in the labs, pre-norm is the default.
+
+## The position-wise MLP
+
+After attention has gathered information from other positions into $h_t$, a two-layer network processes it, *the same network at every position*: $$\mathrm{MLP}(h) \;=\; W_2\,\sigma\big(W_1 h + b_1\big) + b_2,\qquad W_1\in\mathbb{R}^{4d\times d},\quad W_2\in\mathbb{R}^{d\times 4d}.$$ The hidden width is conventionally $4d$; the nonlinearity $\sigma$ is the GELU, $\sigma(x) = x\,\Phi(x)$ with $\Phi$ the standard normal CDF, a smooth version of the ReLU (Hendrycks and Gimpel, 2016). The parameter count is $$\#\text{params}(\mathrm{MLP}) = 4d\cdot d + d\cdot 4d = 8d^2$$ (plus $5d$ biases) --- twice that of attention. Two thirds of the non-embedding parameters of a Transformer are in the MLPs, and so are two thirds of the FLOPs ($16nd^2$ against $8nd^2$ for the attention projections, Section 2.8).
+
+What does it do? The clearest reading is as a **key--value memory** (Geva et al., 2021). Write the rows of $W_1$ as $4d$ vectors $\kappa_1,\dots,\kappa_{4d}\in\mathbb{R}^d$ and the columns of $W_2$ as $4d$ vectors $\nu_1,\dots,\nu_{4d}\in\mathbb{R}^d$. Then $$\mathrm{MLP}(h) = \sum_{j=1}^{4d}\sigma(\kappa_j^{\top}h + b_{1,j})\,\nu_j :$$ each hidden unit tests the input against a key $\kappa_j$ and, if it matches, adds its value $\nu_j$ to the residual stream. This is attention's soft dictionary again, but with *learned, input-independent* keys --- a memory of patterns seen in training, rather than a lookup over the current context. Experiments that edit factual knowledge in a model (Meng et al., 2022) find it concentrated in the MLPs of the middle layers, consistent with the reading.
+
+Note that the MLP is applied independently to each position: it is the same as a $1\times 1$ convolution, and its cost is linear in $n$. Only attention couples positions.
+
+## The block and the full model
+
+Putting the pieces together, one block of a pre-norm decoder-only Transformer is $$\begin{aligned}
+H &\leftarrow H + \mathrm{MHA}\big(\mathrm{LN}_1(H)\big),\\
+H &\leftarrow H + \mathrm{MLP}\big(\mathrm{LN}_2(H)\big),
+\end{aligned}$$ with MHA causally masked and MLP applied row by row. The full model, with inputs $x_{1:n}$:
+
+1.  **Embed.** $H^{(0)} = E[x_{1:n}] + P[1{:}n]\in\mathbb{R}^{n\times d}$ (token embeddings plus positions).
+2.  **Blocks.** $H^{(l)} = \mathrm{Block}_l(H^{(l-1)})$ for $l = 1,\dots,L$.
+3.  **Final norm and unembed.** $Z = \mathrm{LN}_f(H^{(L)})\,U^{\top}\in\mathbb{R}^{n\times V}$; row $t$ holds the logits for $x_{t+1}$.
+4.  **Loss.** $\mathcal{L} = -\frac1n\sum_{t=1}^{n}\log\mathrm{softmax}(Z_t)_{x_{t+1}}$, the cross-entropy of Week 1 averaged over positions.
+
+The architecture is specified by a handful of integers: $V$, $n_{\max}$, $d$, $L$, $h$. GPT-2 small is $(50257, 1024, 768, 12, 12)$; GPT-2 XL is $(50257, 1024, 1600, 48, 25)$; Llama 3 8B is $(128256, 8192, 4096, 32, 32)$ with the Week-3 modifications. The reference implementation in Appendix B is 70 lines of PyTorch and is, up to those modifications, what runs inside every production model.
+
+> **Hook for Week 3.** The structure of the block has been stable since 2019. What changed are the pieces inside it: RMSNorm for LN, SwiGLU for the MLP (three matrices instead of two), RoPE for the positional table, GQA for the key--value projections, no biases anywhere. Each is a local substitution in the code of Appendix B. The "three families" question --- encoder, decoder, encoder-decoder --- is a question about the mask and the training objective, not about the block.
+
+## Counting parameters
+
+With the counts of Sections 2.6 and 3.3, each block has $12d^2$ weights plus $O(d)$ biases and normalization parameters, so $$N \;\approx\; \underbrace{12\,L\,d^2}_{\text{blocks}} \;+\; \underbrace{V d}_{\text{embedding}} \;+\; \underbrace{n_{\max}d}_{\text{positions}}$$ with the unembedding tied to the embedding. For GPT-2 small: $12\cdot 12\cdot 768^2 = 84.9$M, plus $50257\cdot 768 = 38.6$M, plus $1024\cdot 768 = 0.8$M, total $124.3$M --- the published figure is 124M. For GPT-2 XL: $12\cdot 48\cdot 1600^2 = 1475$M plus $80$M plus $1.6$M, about 1.56B, against the published 1.5B. The formula is exact enough to plan a model with.
+
+Two readings of the formula matter for Module 3. First, the embedding term grows linearly in $d$ while the block term grows quadratically, so in small models the embedding is a large share (31% of GPT-2 small) and in large models it is negligible (5% of GPT-2 XL, under 2% in Llama 3 70B). Scaling-law papers routinely report **non-embedding** parameters, $12Ld^2$, for this reason. Second, depth and width enter as $Ld^2$: doubling $d$ costs four times the parameters, doubling $L$ costs two. The aspect ratio $d/L$ of trained models has stayed in a narrow band --- 64 for GPT-2 small, 128 for Llama 3 8B --- because for a fixed budget it is empirically near-optimal over a wide range (Kaplan et al., 2020).
+
+## Counting FLOPs: the $6N$ rule
+
+Section 2.8 counted the forward pass of one layer as $24nd^2 + 4n^2d$. Summing over layers and adding the unembedding ($2nVd$), and ignoring the $n^2$ term for contexts below $6d$, the forward pass costs $$\text{FLOPs}_{\text{fwd}} \;\approx\; 24\,L\,n\,d^2 + 2\,n\,V\,d \;=\; 2\,n\,(12Ld^2 + Vd) \;\approx\; 2\,n\,N .$$ That is: **two FLOPs per parameter per token** --- one multiply and one add, since every weight is used exactly once per token in a matrix--vector product. The backward pass costs about twice the forward (one product for the gradient with respect to the activations, one for the gradient with respect to the weights), so training costs $$\boxed{\;C \;\approx\; 6\,N\,D\;}$$ FLOPs for $N$ parameters and $D$ training tokens (Kaplan et al., 2020). GPT-2 small on 10B tokens: $6\cdot 1.24\times 10^8\cdot 10^{10} = 7.4\times 10^{18}$ FLOPs, about five hours of one H100 at a realistic 40% utilization. Week 4 measures the actual utilization in Lab 4; Week 5 uses $C = 6ND$ as the budget constraint of the scaling laws.
+
+## Training in parallel, generating in sequence
+
+The reason the Transformer displaced recurrent networks is not that it is more expressive. An LSTM can in principle represent the same functions. The reason is the prefix property of Section 2.4 and the shape of the computation that it allows.
+
+**Training.** Given a sequence $x_{1:n+1}$, one forward pass on $x_{1:n}$ produces, in row $t$ of the logits, the distribution $p_\theta(\cdot\mid x_{1:t})$ for *every* $t$ at once. The loss compares row $t$ with $x_{t+1}$ --- the input shifted by one. All $n$ predictions, and all the matrix products behind them, are computed with no sequential dependency between positions: the sequence dimension $n$ is as parallel as the batch dimension. A recurrent network computes $h_t$ from $h_{t-1}$ and cannot start position $t$ before position $t-1$ is done; its wall-clock time per sequence is $\Omega(n)$ regardless of how many processors are available. On hardware whose throughput comes from parallelism, this difference is the whole story.
+
+The procedure --- feed the true prefix, predict the next token, never feed the model its own prediction during training --- is teacher forcing. It has a known cost, *exposure bias*: at generation time the model conditions on its own output, which is a distribution it never saw during training, and errors can compound. Module 6 (alignment) is, from one angle, about correcting this with training signals computed on the model's own samples.
+
+**Generation.** Sampling is inherently sequential: $x_{n+1}$ must be drawn before $x_{n+2}$ can be conditioned on it. Naively, each new token requires a forward pass over the whole prefix, so generating $m$ tokens after a prompt of length $n$ costs $\sum_{t=n}^{n+m}O(t\,d^2 + t^2d)$ --- cubic in the length. The prefix property rescues it: the keys and values of past positions are unchanged by new tokens, so they can be cached, and each new token costs one position's worth of projections plus one query against the cache, $O(d^2 + nd)$ per layer. That is the **KV cache**, and the fact that it works at all is the second claim of the proposition in Section 2.4. Its memory, $2Lnd$ numbers per sequence, is what limits batch size and context at serving time (Module 7).
+
+# What attention learns to compute
+
+A brief look inside, to make the abstract machinery concrete; Week 14 may return to the subject. Because the residual stream is a sum and each head writes into it through its own $W_O^{(i)}$, the heads of a trained model can be inspected one at a time, by their attention patterns and by what they add to the stream.
+
+**Positional heads.** In the first layers of GPT-2, several heads attend almost exclusively to the previous token (a sharp diagonal just below the main one in $A$), or to the first token of the sequence, or to the token itself. A previous-token head is the device by which the model builds bigram-like features: after it, position $t$ carries information about $x_{t-1}$ as well as $x_t$. With one such head per layer, $L$ layers can assemble features of the last $L$ tokens --- the $n$-gram window, reconstructed.
+
+**Induction heads.** The pattern that distinguishes Transformers from $n$-gram models is the one found by Elhage et al. (2021) and Olsson et al. (2022). Consider a sequence in which the token `A` was followed by `B` earlier, and `A` now appears again. An **induction head** attends from the current `A` to the token *after* the previous `A` --- that is, to `B` --- and copies it into the prediction. It is implemented by two heads in two layers: a previous-token head in layer $l$ writes "my predecessor was `A`" into the stream at the position of the old `B`; an attention head in a later layer, with query "I am `A`" and keys reading "my predecessor was `A`", attends to that position and copies its token identity to the output. No $n$-gram can do this: the distance between the two `A`s is arbitrary, and the pair `AB` need never have appeared in training. It is the simplest form of *in-context learning*, and Olsson et al. show that the ability of language models to use their context jumps at the point in training where induction heads form.
+
+**Attention sinks.** In most trained models, a large fraction of every head's attention mass goes to the first token, whatever it is. The interpretation (Xiao et al., 2023) is that a softmax must put its mass somewhere even when no position is relevant, and the first token, visible to all positions, is the convenient dump. It is a side effect of the normalization in Section 2.1, and it matters for streaming inference: evict the first token from the KV cache and the model degrades sharply.
+
+The point of these examples for this lecture: the components of Sections 2 and 3 are not just "a function approximator". They have identifiable algorithmic roles, and the ones found so far --- lookup by content, copying, composition across layers --- are exactly the operations that the $n$-gram lacked.
+
+# Bridge to Lab 2 and to Week 3
+
+**Lab 2 (M2P2), this week.** You will implement, in plain PyTorch:
+
+1.  Scaled dot-product attention with a causal mask, from the formula in Section 2.5, and check it against `F.scaled_dot_product_attention`.
+2.  Multi-head causal self-attention with the one-matrix-product-plus-reshape layout of Section 2.6, and check it numerically against `nn.MultiheadAttention` with the same weights.
+3.  The pre-norm block of Section 3.4 and a parameter counter that reproduces the formula of Section 3.5 for GPT-2's four sizes.
+4.  A memory and time profile of the attention layer as a function of $n$, confirming the $n^2$ growth of Section 2.8 and locating the point where the naive implementation runs out of GPU memory.
+
+Lab 3 stacks the block into a GPT of about 10M parameters and trains it on the Lab 1 corpus, to be evaluated in bits per byte against the $n$-gram baseline.
+
+**Week 3.** The lecture replaces the pieces of the block one by one with their current versions --- RMSNorm, SwiGLU, RoPE (whose building block is the rotation of Section 2.7), GQA --- and then widens the view to the three families (encoder, decoder, encoder-decoder) and to the architectures that try to escape the $n^2$ term (linear attention, state-space models) or the $12Ld^2$ term (mixture of experts).
+
+# Exercises (due with Lab 2)
+
+1.  **Scaling.** Suppose the components of $q$ and $k$ are independent with mean 0 and variances $\sigma_q^2$ and $\sigma_k^2$. Compute the variance of $q^{\top}k$ and the constant by which the scores should be divided to make it 1. Then explain in one sentence why, in practice, the scaling constant is fixed at $\sqrt{d_k}$ and the variances are controlled by other means.
+
+2.  **Softmax Jacobian.** Derive $\partial a_i/\partial s_j = a_i(\delta_{ij} - a_j)$ for $a = \mathrm{softmax}(s)$. Show that for a vector $g$ of upstream gradients, $J^{\top}g = a\odot(g - \langle a, g\rangle\mathbf{1})$, and that $\|J^{\top}g\|\to 0$ as $a$ approaches a one-hot vector.
+
+3.  **Prefix property, carefully.** The proposition in Section 2.4 assumes position-wise maps and causally masked attention. Which of the following break it, and how? (a) Layer normalization. (b) Batch normalization over the sequence dimension. (c) A convolution of width 3 centered at $t$. (d) The same convolution, shifted to cover $t-2,t-1,t$. (e) Dropout.
+
+4.  **Equivariance and the mask.** (a) Complete the proof of Section 2.7 by showing that row-wise softmax satisfies $\mathrm{softmax}(PSP^{\top}) = P\,\mathrm{softmax}(S)\,P^{\top}$. (b) Show by a $3\times 3$ example that *masked* attention is not permutation-equivariant. (c) Explain in one paragraph how a causal model with no positional encoding could nevertheless recover the position of a token.
+
+5.  **Parameter and FLOP counts.** (a) Compute $N$ for GPT-2 medium ($d = 1024$, $L = 24$) and large ($d = 1280$, $L = 36$) with the formula of Section 3.5 and compare with the published 355M and 774M. (b) For Llama 3 8B ($d = 4096$, $L = 32$, $V = 128256$, untied embeddings, no positional table, MLP hidden width 14336 with three matrices instead of two, 8 key--value heads of dimension 128 against 32 query heads), adapt the formula and check that it gives about 8.0B. (c) At what context length does the $n^2$ attention term equal the rest, for this model?
+
+6.  **A bigram model in one attention layer.** Show that a single causal attention head followed by a linear unembedding can implement an arbitrary bigram model $p(x_{t+1}\mid x_t)$ exactly, given a positional encoding that lets the query at $t$ match only the key at $t$ (attend to itself). Then show how a previous-token head plus one MLP implements a trigram model. What does this say about the minimum depth needed to reproduce Lab 1's baseline?
+
+7.  **Memory of the attention matrix.** For a model with $L = 32$ layers and $h = 32$ heads, trained with a batch of 16 sequences in bf16, write the memory of the attention matrices kept for the backward pass as a function of $n$, and find the $n$ at which it reaches 80 GB. Compare with the memory of the parameters of the same model if $d = 4096$.
+
+8.  **Discussion.** Section 3.7 claims that the Transformer won over the LSTM because of parallelism rather than expressivity. Argue for and against: what can a Transformer with $L$ layers compute about a sequence of length $n$ that a recurrent network of comparable size cannot, and vice versa? *Hint:* think about the induction head of Section 4 and about counting (e.g. parity of the number of `a`s seen so far).
+
+# Appendix A --- Proofs and derivations {#appendix-a-proofs-and-derivations .unnumbered}
+
+## A.1 Gradient of the cross-entropy with respect to the logits {#a.1-gradient-of-the-cross-entropy-with-respect-to-the-logits .unnumbered}
+
+::: {.statement}
+**Proposition.** Let $z\in\mathbb{R}^V$, $p = \mathrm{softmax}(z)$ and $\ell(z) = -\log p_y$ for a target class $y$. Then $\partial\ell/\partial z = p - e_y$.
+:::
+
+::: {.argument}
+*Proof.* $\ell(z) = -z_y + \log\sum_j e^{z_j}$. Differentiating, $\partial\ell/\partial z_i = -\delta_{iy} + e^{z_i}/\sum_j e^{z_j} = p_i - \delta_{iy}$. $\square$
+:::
+
+Two consequences. The gradient is bounded: each entry lies in $[-1,1]$, which is one reason the softmax--cross-entropy pair trains stably. And its magnitude measures the error: when $p_y\to 1$ the gradient vanishes, when $p_y\to 0$ it approaches $-1$ on the target coordinate.
+
+## A.2 Jacobian of the softmax {#a.2-jacobian-of-the-softmax .unnumbered}
+
+::: {.statement}
+**Proposition.** For $a = \mathrm{softmax}(s)$, $\dfrac{\partial a_i}{\partial s_j} = a_i(\delta_{ij} - a_j)$; in matrix form $J = \mathrm{diag}(a) - aa^{\top}$. For any upstream gradient $g$, $J^{\top}g = a\odot(g - \langle a,g\rangle\mathbf{1})$.
+:::
+
+::: {.argument}
+*Proof.* With $Z = \sum_k e^{s_k}$, $a_i = e^{s_i}/Z$ and $\partial Z/\partial s_j = e^{s_j}$. For $i = j$: $\partial a_i/\partial s_i = (e^{s_i}Z - e^{s_i}e^{s_i})/Z^2 = a_i - a_i^2$. For $i\ne j$: $\partial a_i/\partial s_j = -e^{s_i}e^{s_j}/Z^2 = -a_ia_j$. Both cases are $a_i(\delta_{ij}-a_j)$. Since $J$ is symmetric, $(J^{\top}g)_j = \sum_i a_i(\delta_{ij}-a_j)g_i = a_jg_j - a_j\sum_ia_ig_i$. $\square$
+:::
+
+If $a$ is close to a one-hot vector $e_k$, then $a_j\approx 0$ for $j\ne k$ kills those coordinates, and for $j = k$ the factor $g_k - \langle a,g\rangle\approx g_k - g_k = 0$. The gradient through a saturated softmax vanishes in every coordinate. This is the computation behind Section 2.3.
+
+## A.3 Sinusoidal positions: the shift is a rotation {#a.3-sinusoidal-positions-the-shift-is-a-rotation .unnumbered}
+
+::: {.statement}
+**Proposition.** For any $\omega$, $t$ and $k$, $\begin{pmatrix}\sin\omega(t+k)\\ \cos\omega(t+k)\end{pmatrix} = R(\omega k)\begin{pmatrix}\sin\omega t\\ \cos\omega t\end{pmatrix}$ with $R(\phi) = \begin{pmatrix}\cos\phi & \sin\phi\\ -\sin\phi & \cos\phi\end{pmatrix}$, an orthogonal matrix that does not depend on $t$.
+:::
+
+::: {.argument}
+*Proof.* The addition formulas give $\sin\omega(t+k) = \sin\omega t\cos\omega k + \cos\omega t\sin\omega k$ and $\cos\omega(t+k) = \cos\omega t\cos\omega k - \sin\omega t\sin\omega k$, which is the stated product. $R(\phi)^{\top}R(\phi) = I$ since $\cos^2+\sin^2 = 1$. $\square$
+:::
+
+Applied to each of the $d/2$ frequency pairs, the full positional vector satisfies $p_{t+k} = \mathrm{blockdiag}\big(R(\omega_1k),\dots,R(\omega_{d/2}k)\big)\,p_t$. Two further facts follow. The dot product $p_t^{\top}p_{t+k} = \sum_i\cos(\omega_ik)$ depends on $k$ only, so sinusoidal positions encode relative distance in their inner products. And the geometric spacing of the $\omega_i$ gives a representation of $t$ that is unique over a range of about $2\pi\cdot 10000$ positions, like the hands of a clock with $d/2$ dials of increasing period.
+
+## A.4 Scale invariance of layer normalization {#a.4-scale-invariance-of-layer-normalization .unnumbered}
+
+Write $\hat h = (h-\mu)/\sigma$ for the normalized vector, ignoring $\epsilon$ and the affine parameters. For $\alpha > 0$, replacing $h$ by $\alpha h$ multiplies $\mu$ by $\alpha$ and $\sigma$ by $\alpha$, so $\hat h$ is unchanged: $\mathrm{LN}(\alpha h) = \mathrm{LN}(h)$.
+
+::: {.statement}
+**Proposition.** The Jacobian of $h\mapsto\hat h$ is $\dfrac{1}{\sigma}\big(I - \tfrac1d\mathbf{1}\mathbf{1}^{\top} - \tfrac1d\hat h\hat h^{\top}\big)$. In particular it scales as $1/\sigma$, and $\hat h$ and $\mathbf{1}$ are in its kernel.
+:::
+
+::: {.argument}
+*Proof (sketch).* $\partial\mu/\partial h = \frac1d\mathbf{1}^{\top}$ and $\partial\sigma/\partial h = \frac{1}{d\sigma}(h-\mu)^{\top} = \frac1d\hat h^{\top}$. By the quotient rule, $\partial\hat h/\partial h = \frac1\sigma(I - \frac1d\mathbf{1}\mathbf{1}^{\top}) - \frac{1}{\sigma^2}(h-\mu)\cdot\frac1d\hat h^{\top} = \frac1\sigma(I - \frac1d\mathbf{1}\mathbf{1}^{\top} - \frac1d\hat h\hat h^{\top})$. The matrix in parentheses is the projection onto the orthogonal complement of $\mathrm{span}\{\mathbf{1},\hat h\}$, since $\|\hat h\|^2 = d$ and $\mathbf{1}^{\top}\hat h = 0$. $\square$
+:::
+
+The $1/\sigma$ factor is the self-stabilization mentioned in Section 3.2: the gradient reaching the residual stream through a normalized sublayer is inversely proportional to the scale of the stream. A consequence for optimization (Module 3): for weights $W$ that feed into a normalization layer, the loss is invariant to $\|W\|$, so the gradient is orthogonal to $W$ and the effective learning rate is $\eta/\|W\|^2$ --- which is why weight decay interacts with normalization in non-obvious ways.
+
+## A.5 Why the backward pass costs twice the forward {#a.5-why-the-backward-pass-costs-twice-the-forward .unnumbered}
+
+Consider one linear layer $Y = XW$ with $X\in\mathbb{R}^{n\times d_{\text{in}}}$, $W\in\mathbb{R}^{d_{\text{in}}\times d_{\text{out}}}$: the forward costs $2nd_{\text{in}}d_{\text{out}}$ FLOPs. Given the upstream gradient $G = \partial\mathcal{L}/\partial Y\in\mathbb{R}^{n\times d_{\text{out}}}$, the backward pass needs two products: $$\frac{\partial\mathcal{L}}{\partial X} = GW^{\top}\quad(2nd_{\text{in}}d_{\text{out}}\text{ FLOPs}),\qquad
+\frac{\partial\mathcal{L}}{\partial W} = X^{\top}G\quad(2nd_{\text{in}}d_{\text{out}}\text{ FLOPs}).$$ The first propagates the gradient to the previous layer, the second produces the update. Each costs the same as the forward, so the backward is $2\times$ and the total is $3\times$ the forward: $3\cdot 2N = 6N$ FLOPs per token. The count ignores the attention scores (which contribute the $n^2$ term, with the same $3\times$ factor), the nonlinearities and the normalizations, all of which are $O(nd)$ and negligible against $O(nd^2)$.
+
+# Appendix B --- Reference code {#appendix-b-reference-code .unnumbered}
+
+The code below is the complete model of Section 3.4, written to match the notation of the notes rather than for speed. Lab 2 asks for the attention parts; Lab 3 trains the whole thing. The structure follows Karpathy's `nanoGPT`, which is the reference implementation to read next.
+
+## B.1 Causal self-attention {#b.1-causal-self-attention .unnumbered}
+
+```python
+# Multi-head causal self-attention (Sections 2.5--2.6), in the layout used by every
+# production implementation: one d x 3d projection for Q, K, V of all heads at once,
+# a reshape to [batch, heads, seq, d_head], attention per head, reshape back, W_O.
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d, n_heads, n_ctx, dropout=0.0):
+        super().__init__()
+        assert d % n_heads == 0
+        self.d, self.h, self.dk = d, n_heads, d // n_heads
+        self.qkv = nn.Linear(d, 3 * d)          # W_Q | W_K | W_V, stacked
+        self.proj = nn.Linear(d, d)             # W_O
+        self.drop = nn.Dropout(dropout)
+        # lower-triangular mask, stored as a buffer (not a parameter)
+        mask = torch.tril(torch.ones(n_ctx, n_ctx, dtype=torch.bool))
+        self.register_buffer("mask", mask.view(1, 1, n_ctx, n_ctx))
+
+    def forward(self, x):                       # x: [B, n, d]
+        B, n, d = x.shape
+        q, k, v = self.qkv(x).split(d, dim=-1)  # each [B, n, d]
+        # [B, n, d] -> [B, n, h, dk] -> [B, h, n, dk]
+        q = q.view(B, n, self.h, self.dk).transpose(1, 2)
+        k = k.view(B, n, self.h, self.dk).transpose(1, 2)
+        v = v.view(B, n, self.h, self.dk).transpose(1, 2)
+        # scores: [B, h, n, dk] @ [B, h, dk, n] -> [B, h, n, n]
+        s = (q @ k.transpose(-2, -1)) / math.sqrt(self.dk)
+        s = s.masked_fill(~self.mask[:, :, :n, :n], float("-inf"))
+        a = F.softmax(s, dim=-1)                # rows sum to 1; row t is the pattern of t
+        a = self.drop(a)
+        y = a @ v                               # [B, h, n, dk]
+        y = y.transpose(1, 2).contiguous().view(B, n, d)   # concatenate heads
+        return self.proj(y)
+```
+
+The three lines from `s = ...` to `y = a @ v` are the formula of Section 2.5. In production they are replaced by `F.scaled_dot_product_attention(q, k, v, is_causal=True)`, which dispatches to FlashAttention when available and never materializes `a`; Lab 2 compares the two.
+
+## B.2 Block and model {#b.2-block-and-model .unnumbered}
+
+```python
+# Pre-norm Transformer block (Section 3.4) and the decoder-only model.
+class MLP(nn.Module):
+    def __init__(self, d, dropout=0.0):
+        super().__init__()
+        self.fc = nn.Linear(d, 4 * d)           # W_1: keys of the key-value memory
+        self.proj = nn.Linear(4 * d, d)         # W_2: values
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.drop(self.proj(F.gelu(self.fc(x))))
+
+class Block(nn.Module):
+    def __init__(self, d, n_heads, n_ctx, dropout=0.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d)
+        self.attn = CausalSelfAttention(d, n_heads, n_ctx, dropout)
+        self.ln2 = nn.LayerNorm(d)
+        self.mlp = MLP(d, dropout)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))          # mixes positions
+        x = x + self.mlp(self.ln2(x))           # position-wise
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size, n_ctx, d, n_layers, n_heads, dropout=0.0):
+        super().__init__()
+        self.n_ctx = n_ctx
+        self.tok_emb = nn.Embedding(vocab_size, d)      # E
+        self.pos_emb = nn.Embedding(n_ctx, d)           # P (learned absolute positions)
+        self.drop = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(
+            [Block(d, n_heads, n_ctx, dropout) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(d)
+        self.head = nn.Linear(d, vocab_size, bias=False)   # U
+        self.head.weight = self.tok_emb.weight             # weight tying: U = E
+        self.apply(self._init)
+
+    def _init(self, m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+        if isinstance(m, nn.Linear) and m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+    def forward(self, idx, targets=None):       # idx: [B, n] of token ids
+        B, n = idx.shape
+        assert n <= self.n_ctx
+        pos = torch.arange(n, device=idx.device)
+        x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))   # [B, n, d]
+        for block in self.blocks:
+            x = block(x)
+        logits = self.head(self.ln_f(x))                       # [B, n, V]
+        loss = None
+        if targets is not None:                 # targets = idx shifted left by one
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0):
+        # Ancestral sampling, recomputing the whole prefix each step (no KV cache).
+        for _ in range(max_new_tokens):
+            logits, _ = self(idx[:, -self.n_ctx:])
+            probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
+            idx = torch.cat([idx, torch.multinomial(probs, 1)], dim=1)
+        return idx
+
+def count_params(model, non_embedding=True):
+    n = sum(p.numel() for p in model.parameters())
+    if non_embedding:               # positions are not shared with the head; subtract them
+        n -= model.pos_emb.weight.numel()
+    return n
+
+# GPT-2 small: 124M parameters (Section 3.5)
+# model = GPT(vocab_size=50257, n_ctx=1024, d=768, n_layers=12, n_heads=12)
+# print(count_params(model, non_embedding=False) / 1e6)   # -> 124.4
+```
+
+Weight tying makes `count_params` count the embedding once, which is why the figure agrees with Section 3.5. The `generate` method is deliberately naive --- it recomputes the full prefix at every step, the cubic cost of Section 3.7; Lab 3 adds the KV cache.
+
+# References for this lecture {#references-for-this-lecture .unnumbered}
+
+**Textbooks**
+
+-   Jurafsky, D.; Martin, J. H. *Speech and Language Processing*, 3rd ed. (online draft), ch. 6 (vector semantics and embeddings), ch. 7 (neural networks and neural language models), ch. 9 (the Transformer). <https://web.stanford.edu/~jurafsky/slp3/>
+
+-   Raschka, S. *Build a Large Language Model (From Scratch)*. Manning, 2024. Ch. 3 (attention, with code) and ch. 4 (the GPT model).
+
+-   Prince, S. J. D. *Understanding Deep Learning*. MIT Press, 2023. Ch. 12 (Transformers). <https://udlbook.github.io/udlbook/>
+
+**Papers**
+
+-   Bengio, Y.; Ducharme, R.; Vincent, P.; Jauvin, C. A neural probabilistic language model. *JMLR*, 3, 2003.
+
+-   Mikolov, T.; Sutskever, I.; Chen, K.; Corrado, G.; Dean, J. Distributed representations of words and phrases and their compositionality. *NeurIPS*, 2013.
+
+-   Levy, O.; Goldberg, Y. Neural word embedding as implicit matrix factorization. *NeurIPS*, 2014.
+
+-   Press, O.; Wolf, L. Using the output embedding to improve language models. *EACL*, 2017.
+
+-   Bahdanau, D.; Cho, K.; Bengio, Y. Neural machine translation by jointly learning to align and translate. *ICLR*, 2015.
+
+-   Vaswani, A. et al. Attention is all you need. *NeurIPS*, 2017.
+
+-   He, K.; Zhang, X.; Ren, S.; Sun, J. Deep residual learning for image recognition. *CVPR*, 2016.
+
+-   Ba, J. L.; Kiros, J. R.; Hinton, G. E. Layer normalization. arXiv:1607.06450, 2016.
+
+-   Hendrycks, D.; Gimpel, K. Gaussian error linear units (GELUs). arXiv:1606.08415, 2016.
+
+-   Radford, A. et al. Language models are unsupervised multitask learners (GPT-2). OpenAI, 2019.
+
+-   Xiong, R. et al. On layer normalization in the Transformer architecture. *ICML*, 2020.
+
+-   Kaplan, J. et al. Scaling laws for neural language models. arXiv:2001.08361, 2020. (Section 2.1 of the paper for the parameter and FLOP counts.)
+
+-   Geva, M.; Schuster, R.; Berant, J.; Levy, O. Transformer feed-forward layers are key-value memories. *EMNLP*, 2021.
+
+-   Meng, K.; Bau, D.; Andonian, A.; Belinkov, Y. Locating and editing factual associations in GPT. *NeurIPS*, 2022.
+
+-   Elhage, N. et al. A mathematical framework for Transformer circuits. Anthropic, 2021. Olsson, C. et al. In-context learning and induction heads. Anthropic, 2022.
+
+-   Haviv, A.; Ram, O.; Press, O.; Izsak, P.; Levy, O. Transformer language models without positional encodings still learn positional information. *Findings of EMNLP*, 2022.
+
+-   Dao, T.; Fu, D.; Ermon, S.; Rudra, A.; Ré, C. FlashAttention: fast and memory-efficient exact attention with IO-awareness. *NeurIPS*, 2022.
+
+-   Xiao, G.; Tian, Y.; Chen, B.; Han, S.; Lewis, M. Efficient streaming language models with attention sinks. *ICLR*, 2024.
+
+**Code and video**
+
+-   Karpathy, A. *Let's build GPT: from scratch, in code, spelled out* (video, 2023) and the `nanoGPT` repository --- the reference implementation for Labs 2 and 3.
+
+-   Stanford CS336, *Language Modeling from Scratch*, lecture 2 (PyTorch, resource accounting) and lecture 3 (architectures) --- the FLOP and memory accounting of Section 3.6 in more detail.
+
+-   *The Illustrated Transformer* (J. Alammar) and *The Annotated Transformer* (Harvard NLP) --- visual and line-by-line walkthroughs of the original architecture.

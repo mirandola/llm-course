@@ -28,7 +28,7 @@ project.
 | Week | Module | Lecture | Lab |
 |:--:|:--:|:---|:---|
 | 1 | 1 | [Language modeling, perplexity, compression; $n$-grams; BPE and its consequences](notes/M1P1.qmd) | [Lab 1 — byte-level BPE and an $n$-gram baseline](labs/lab1.qmd) |
-| 2 | 2 | Embeddings; scaled dot-product attention, causal mask, multi-head; $O(n^2)$ cost; the Transformer block | Lab 2 — attention and Transformer block in plain PyTorch; test against `nn.MultiheadAttention`; memory profile vs. length |
+| 2 | 2 | [Embeddings; scaled dot-product attention, causal mask, multi-head; $O(n^2)$ cost; the Transformer block](notes/M2P1.qmd) | [Lab 2 — attention and Transformer block in plain PyTorch; test against `nn.MultiheadAttention`; memory profile vs. length](labs/lab2.qmd) |
 | 3 | 2 | The Llama recipe: pre-norm, RMSNorm, SwiGLU, RoPE, GQA. The three families. MoE, linear attention and SSMs (overview) | Lab 3 — GPT of ~10M parameters on a small corpus; sampling; absolute positions vs. RoPE |
 | 4 | 3 | AdamW, schedules, clipping, bf16, accumulation; diagnosing instabilities; FLOPs and memory; FlashAttention | Lab 4 — 50–125M model on a FineWeb-Edu subset; throughput, memory, utilization; reproduce and fix a loss spike |
 | 5 | 3 | Scaling laws; budget allocation; data-constrained regime; curation and deduplication; parallelism (1 h, lecture only) | Lab 5 — mini scaling experiment (3 sizes × 2 token budgets); power-law fit. Consolidated delivery of labs 1–5 |

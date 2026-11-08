@@ -1,11 +1,11 @@
 """Builds the student and solutions notebooks from the single Quarto source.
 
-    python make_lab_versions.py M1P2_lab1.qmd
+    python tools/make_lab_versions.py labs/lab2.qmd M2P2_lab2
 
-Produces, next to the source:
-    M1P2_lab1_student.qmd    - solution regions replaced by a stub
-    M1P2_lab1_student.ipynb  - same, as a Jupyter notebook (Colab-ready)
-    M1P2_lab1_solutions.ipynb- the full source as a notebook
+Produces, next to the source (the second argument is the output stem; default: the
+source's stem):
+    M2P2_lab2_student.ipynb   - solution regions replaced by a stub (Colab-ready)
+    M2P2_lab2_solutions.ipynb - the full source as a notebook
 
 Solution regions are delimited inside code cells by the lines
     # --- SOLUTION START ---
@@ -37,6 +37,9 @@ def strip_solutions(code):
 def split_cells(qmd):
     """Yields ('markdown', text) and ('code', text) in document order; drops the YAML header."""
     body = re.sub(r"\A---\n.*?\n---\n", "", qmd, count=1, flags=re.S)
+    # blocks between <!-- page-only --> and <!-- /page-only --> (Colab badge etc.) stay on the
+    # rendered page but are dropped from the notebooks
+    body = re.sub(r"<!-- page-only -->.*?<!-- /page-only -->\n?", "", body, flags=re.S)
     body = re.sub(r"<!--.*?-->\n?", "", body, flags=re.S)          # HTML comments
     pattern = re.compile(r"```\{python\}\n(.*?)```", re.S)
     pos = 0
@@ -73,15 +76,14 @@ def to_notebook(cells):
     }
 
 
-def main(src):
+def main(src, stem=None):
     src = pathlib.Path(src)
     qmd = src.read_text(encoding="utf-8")
-    stem = src.stem
+    stem = stem or src.stem
 
     student_qmd = re.sub(r"```\{python\}\n(.*?)```",
                          lambda m: "```{python}\n" + strip_solutions(m.group(1)) + "```",
                          qmd, flags=re.S)
-    (src.parent / f"{stem}_student.qmd").write_text(student_qmd, encoding="utf-8")
 
     for name, text in [("solutions", qmd), ("student", student_qmd)]:
         nb = to_notebook(list(split_cells(text)))
@@ -91,4 +93,4 @@ def main(src):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "M1P2_lab1.qmd")
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)

@@ -1,0 +1,1150 @@
+% Slides M2P1 -- Embeddings, attention and the Transformer block
+% Large Language Models (60h) -- Module 2, lecture 1 -- Week 2
+%
+% Compile with: pdflatex M2P1_lecture_slides.tex (twice, for the table of contents)
+% Derived from the lecture notes M2P1.qmd; sections and examples match one to one.
+% One idea per frame; details and proofs are in the notes.
+% No overlays (\pause, \uncover): each frame is one page.
+
+\documentclass[11pt,aspectratio=169]{beamer}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit}
+
+% --- Theme: deliberately neutral, to be replaced by the course's usual theme ---
+\usetheme{default}
+\usecolortheme{default}
+\useinnertheme{rectangles}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}{%
+  \hfill{\scriptsize\insertsection\quad\insertframenumber/\inserttotalframenumber}\hspace{0.5em}\vspace{0.3em}}
+\setbeamertemplate{section in toc}[sections numbered]
+\setbeamercolor{block title}{bg=structure!15,fg=structure}
+\setbeamercolor{block body}{bg=structure!5}
+\setbeamertemplate{blocks}[rounded][shadow=false]
+\setbeamerfont{frametitle}{series=\bfseries}
+\setbeamertemplate{itemize item}{\textbullet}
+\setbeamertemplate{itemize subitem}{--}
+\setlength{\leftmargini}{1.2em}
+\AtBeginSection[]{\begin{frame}{Outline}\tableofcontents[currentsection]\end{frame}}
+
+% --- Python code ---
+\lstdefinestyle{py}{
+  language=Python,
+  basicstyle=\ttfamily\scriptsize,
+  commentstyle=\color{gray!70!black}\itshape,
+  keywordstyle=\color{structure}\bfseries,
+  stringstyle=\color{red!60!black},
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{gray!50},
+  xleftmargin=0.5em,
+  inputencoding=utf8,
+  extendedchars=true,
+  literate={á}{{\'a}}1 {ã}{{\~a}}1 {â}{{\^a}}1 {é}{{\'e}}1 {ê}{{\^e}}1 {í}{{\'i}}1
+           {ó}{{\'o}}1 {õ}{{\~o}}1 {ô}{{\^o}}1 {ú}{{\'u}}1 {ç}{{\c{c}}}1 {É}{{\'E}}1,
+}
+
+% --- Shorthands ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\V}{\mathcal{V}}
+\newcommand{\Lc}{\mathcal{L}}
+\newcommand{\ptheta}{p_{\theta}}
+\newcommand{\sm}{\mathrm{softmax}}
+\newcommand{\LN}{\mathrm{LN}}
+\newcommand{\MLP}{\mathrm{MLP}}
+\newcommand{\MHA}{\mathrm{MHA}}
+\newcommand{\T}{^{\top}}
+\newcommand{\dest}[1]{\textcolor{structure}{\textbf{#1}}}
+\newcommand{\hook}[1]{{\small\textcolor{gray!60!black}{\textit{#1}}}}
+
+% --- tikz styles for the block diagram ---
+\tikzset{
+  box/.style={draw, rounded corners=2pt, minimum width=2.6cm, minimum height=0.6cm, font=\small, fill=structure!8},
+  op/.style={draw, circle, inner sep=1pt, font=\small, fill=white},
+  arr/.style={-{Latex[length=2mm]}, thick},
+}
+
+\title{Embeddings, attention and the Transformer block}
+\subtitle{Large Language Models \,\textperiodcentered\, Module 2, lecture 1 (M2P1) \,\textperiodcentered\, Week 2}
+\author{Heudson Mirandola}
+\institute{Instituto de Matemática, UFRJ}
+\date{November 2026}
+
+\begin{document}
+
+\begin{frame}[plain]
+  \titlepage
+\end{frame}
+
+\begin{frame}{Where we are}
+  Week 1 left two structural defects of the $n$-gram:
+  \begin{enumerate}
+    \item \textbf{No sharing:} ``o gato dorme'' and ``o cão dorme'' are unrelated keys.
+    \item \textbf{Fixed window:} nothing older than $n-1$ tokens exists.
+  \end{enumerate}
+
+  \vspace{1em}
+  Today: the neural model that answers both, one component at a time,\\
+  ending with the complete decoder-only Transformer.
+\end{frame}
+
+\begin{frame}{One idea organizes the lecture}
+  \begin{block}{}
+    \centering\large
+    A Transformer alternates two operations:\\[0.3em]
+    one that mixes information \textbf{across positions} (attention)\\
+    and one that processes \textbf{each position on its own} (the MLP).\\[0.5em]
+    Attention is the only place where positions talk --- and it is\\
+    a weighted average with data-dependent weights.
+  \end{block}
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item \textbf{Section 1:} embeddings and Bengio's model --- defect 1 solved, window kept.
+    \item \textbf{Section 2:} attention, derived from three requirements; its four design decisions.
+    \item \textbf{Section 3:} the block --- residuals, normalization, MLP; parameters and FLOPs.
+    \item \textbf{Section 4:} what trained attention heads actually compute.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Objectives}
+  By the end of the lecture you should be able to
+  \begin{enumerate}
+    \item explain what an embedding matrix is and why it solves the sharing problem;
+    \item derive scaled dot-product attention and justify each of its design decisions;
+    \item prove the prefix property of causal attention and say what it buys at inference;
+    \item write the pre-norm block and count its parameters and FLOPs;
+    \item explain why training is parallel and generation is not.
+  \end{enumerate}
+
+  \vspace{1em}
+  \textbf{Conventions:} vectors are columns; sequences are stacked as \emph{rows} of
+  $H\in\R^{n\times d}$ (PyTorch's \texttt{[batch, seq, dim]}), so linear maps act on the
+  right: $HW$. Softmax on a matrix acts on each row.\\
+  $d$ = width, $n$ = sequence length, $V$ = vocabulary, $L$ = layers, $h$ = heads.
+\end{frame}
+
+% =====================================================================
+\section{Embeddings}
+
+\begin{frame}{One-hot vectors}
+  A neural network needs a vector, not an integer. The trivial vectorization:
+  \[
+    e_v\in\R^V,\qquad (e_v)_i = \begin{cases}1 & i = v\\ 0 & \text{otherwise.}\end{cases}
+  \]
+
+  \vspace{0.6em}
+  Useless as a representation: $\|e_v - e_w\|^2 = 2$ for all $v\neq w$ --- every token
+  is equally far from every other.
+
+  \vspace{0.8em}
+  But the right starting point, because \dest{a linear map applied to $e_v$ selects a row}.
+\end{frame}
+
+\begin{frame}{The embedding matrix}
+  Fix $d\ll V$ and $E\in\R^{V\times d}$. The embedding of token $v$:
+  \[
+    x_v \;=\; E\T e_v \;=\; \text{row } v \text{ of } E\;\in\R^d .
+  \]
+
+  \vspace{0.6em}
+  \begin{itemize}
+    \item A lookup table with $V$ rows of length $d$, trained by gradient descent.
+    \item The lookup is \emph{linear}: backprop = ``add the gradient to the row used''.
+    \item \texttt{nn.Embedding} is exactly this, with the product replaced by indexing.
+  \end{itemize}
+
+  \vspace{0.8em}
+  \begin{tabular}{@{}lrrr@{}}
+    \toprule
+    & $V$ & $d$ & $Vd$ \\
+    \midrule
+    GPT-2 small & 50{,}257 & 768 & 38.6M \quad(31\% of the model) \\
+    Llama 3 8B & 128{,}256 & 4{,}096 & 525M \quad(7\%) \\
+    \bottomrule
+  \end{tabular}
+\end{frame}
+
+\begin{frame}{Bengio's neural language model (2003)}
+  Keep the Markov assumption; replace the count table by a function of embeddings:
+  \[
+    \ptheta(x_t\mid x_{t-n+1},\dots,x_{t-1}) = \sm\big(U\,\sigma(Wc_t + b) + b'\big)_{x_t},
+  \]
+  with $c_t = [x_{t-n+1};\dots;x_{t-1}]\in\R^{(n-1)d}$ the concatenation of the $n-1$ embeddings.
+
+  \vspace{0.6em}
+  \begin{center}
+  \begin{tikzpicture}[node distance=0.5cm and 0.8cm]
+    \node[box, minimum width=1.4cm] (e1) {$x_{t-3}$};
+    \node[box, minimum width=1.4cm, right=0.25cm of e1] (e2) {$x_{t-2}$};
+    \node[box, minimum width=1.4cm, right=0.25cm of e2] (e3) {$x_{t-1}$};
+    \node[box, right=1.2cm of e3] (h) {$\sigma(Wc_t + b)\in\R^m$};
+    \node[box, right=1.2cm of h] (o) {$\sm(Uh + b')\in\R^V$};
+    \node[fit=(e1)(e3), draw, dashed, inner sep=3pt, label=below:{\small $c_t$: concatenation}] {};
+    \draw[arr] (e3.east) ++(0.15,0) -- (h.west);
+    \draw[arr] (h) -- (o);
+  \end{tikzpicture}
+  \end{center}
+
+  \vspace{0.4em}
+  Two things change relative to the $n$-gram. Separate them.
+\end{frame}
+
+\begin{frame}{Change 1: parameter count}
+  \begin{center}
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    trigram table & up to $V^3$ cells \\
+    Bengio, window $n$ & $Vd + m(n-1)d + Vm$ \quad --- \emph{linear} in $V$ and in $n$ \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.8em}
+  Example: $V = 20{,}000$, $d = 100$, $m = 500$, $n = 5$:
+  \[
+    2\text{M} + 0.2\text{M} + 10\text{M} \quad\text{vs.}\quad V^5 = 3.2\times 10^{21}\ \text{cells.}
+  \]
+
+  \vspace{0.6em}
+  Of those $10^{21}$ cells the corpus fills a negligible fraction. The neural model has no
+  empty cells --- every parameter is used by every prediction.
+\end{frame}
+
+\begin{frame}{Change 2: sharing --- the point}
+  \begin{itemize}
+    \item Count table: ``o gato dorme'' and ``o cão dorme'' are unrelated keys.
+    \item Neural model: both map to nearby points of $\R^{(n-1)d}$ \emph{if}
+          $x_{\text{gato}}\approx x_{\text{cão}}$; a smooth function then predicts alike.
+    \item The model is \emph{forced} to learn embeddings with that property: it is the only
+          way to fit the data with few parameters.
+  \end{itemize}
+
+  \vspace{0.8em}
+  \begin{block}{Defect 1 of the $n$-gram is solved}
+    Not by cleverer smoothing, but by changing the representation of the history from a
+    discrete key to a point in a vector space, where ``similar'' has a meaning the model
+    can exploit.
+  \end{block}
+
+  \vspace{0.5em}
+  Bengio (2003): $-24\%$ perplexity vs.\ the best smoothed $n$-gram on Brown.\\
+  Defect 2 --- the fixed window --- untouched: $c_t$ has fixed length $(n-1)d$.
+\end{frame}
+
+\begin{frame}{The output layer: logits and their gradient}
+  The last two operations survive unchanged into the Transformer:
+  \[
+    z = Uh\in\R^V\ \text{(\dest{logits})},\qquad z_w = u_w\T h,\qquad
+    \ptheta(w\mid h) = \sm(z)_w .
+  \]
+  $U$ is the \dest{unembedding}: one vector $u_w$ per token; the score of $w$ is a dot
+  product with the hidden state.
+
+  \vspace{0.8em}
+  Cross-entropy, differentiated with respect to the logits (notes, A.1):
+  \[
+    \frac{\partial\ell}{\partial z} \;=\; \ptheta(\cdot\mid h) - e_y .
+  \]
+  Predicted distribution minus one-hot target. Bounded in $[-1,1]$; vanishes as $p_y\to 1$.\\
+  Every parameter of the network receives its gradient through this vector.
+\end{frame}
+
+\begin{frame}{Weight tying}
+  When $m = d$, $E\in\R^{V\times d}$ and $U\in\R^{V\times d}$ have the same shape and the
+  same meaning --- a vector per token. Set $U = E$.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item Saves $Vd$ parameters: 31\% of GPT-2 small.
+    \item Acts as a regularizer (Press \& Wolf 2017; Inan et al.\ 2017).
+    \item GPT-2 ties; Llama 3 8B/70B do not (saving negligible, untied fits slightly better);
+          Llama 3.2 1B/3B tie again.
+  \end{itemize}
+
+  \vspace{0.8em}
+  The lab's GPT (Lab 3) ties.
+\end{frame}
+
+\begin{frame}{Static vs.\ contextual embeddings}
+  \textbf{Static} (word2vec, GloVe): train the table $E$ as the end product, with a cheap
+  surrogate objective (predict neighbors).
+  \begin{itemize}
+    \item $x_{\text{king}} - x_{\text{man}} + x_{\text{woman}}\approx x_{\text{queen}}$
+          --- explained by Levy \& Goldberg (2014): skip-gram factorizes a shifted PMI matrix.
+    \item One vector per token: \texttt{banco} (bench) and \texttt{banco} (bank) collapse.
+  \end{itemize}
+
+  \vspace{0.8em}
+  \textbf{Contextual}: in a deep LM, $x_t$ is only the input of layer 1. The vector
+  $h^{(l)}_t$ computed at position $t$ in layer $l$ depends on the whole prefix ---
+  a different vector for each occurrence.
+
+  \vspace{0.6em}
+  The rest of the lecture: how $h^{(l)}_t$ is computed.
+\end{frame}
+
+\begin{frame}{The remaining problem}
+  Replace the fixed-length $c_t$ by a summary $h_t\in\R^d$ of the \emph{entire} prefix
+  $x_1,\dots,x_{t-1}$, under three requirements:
+
+  \vspace{0.6em}
+  \begin{enumerate}
+    \item \textbf{Parameters independent of $t$} --- otherwise a lookup table over histories.
+    \item \textbf{Parallel over $t = 1,\dots,n$} --- otherwise training on $10^{12}$ tokens is
+          impractical (this is what killed RNNs).
+    \item \textbf{Retrieve specific information from specific positions} --- not a blurred
+          average (copying, agreement, reference).
+  \end{enumerate}
+
+  \vspace{0.8em}
+  \dest{Attention satisfies the three.}
+\end{frame}
+
+% =====================================================================
+\section{Attention}
+
+\begin{frame}{Averaging as a starting point}
+  Simplest fixed-size summary of $v_1,\dots,v_t$: the mean $h_t = \frac1t\sum_{s\le t}v_s$.\\
+  No parameters, trivially parallel, useless: all past positions alike.
+
+  \vspace{0.8em}
+  Next simplest: a \dest{weighted} average with data-dependent weights,
+  \[
+    h_t = \sum_{s=1}^{t} a_{ts}\,v_s,\qquad a_{ts}\ge 0,\quad \sum_{s\le t}a_{ts} = 1 .
+  \]
+
+  \vspace{0.6em}
+  The row $(a_{t1},\dots,a_{tt})$ is the \dest{attention pattern} of position $t$.\\
+  The whole of attention is a choice of how to compute it from the data.
+\end{frame}
+
+\begin{frame}{Scores and softmax}
+  Let the weight depend on how \emph{relevant} $s$ is to $t$:
+  \[
+    a_{ts} = \frac{\exp\mathrm{score}(h_t,h_s)}{\sum_{s'\le t}\exp\mathrm{score}(h_t,h_{s'})} .
+  \]
+
+  \vspace{0.8em}
+  The softmax does two jobs:
+  \begin{itemize}
+    \item makes the weights positive and normalized;
+    \item because $\exp$ amplifies differences, it can put almost all weight on one position
+          when one score dominates --- requirement 3 --- while staying differentiable,
+          unlike $\arg\max$.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Queries, keys, values}
+  Vaswani et al.\ (2017): the score is a dot product between two \emph{linear projections},
+  \[
+    q_t = W_Q\T h_t,\qquad k_s = W_K\T h_s,\qquad
+    \mathrm{score}(h_t,h_s) = \frac{q_t\T k_s}{\sqrt{d_k}},
+  \]
+  $W_Q,W_K\in\R^{d\times d_k}$. The vector averaged is a third projection, $v_s = W_V\T h_s$,
+  $W_V\in\R^{d\times d_v}$.
+
+  \vspace{0.8em}
+  \begin{tabular}{@{}ll@{}}
+    \dest{query} $q_t$ & what position $t$ is looking for \\
+    \dest{key} $k_s$ & what position $s$ offers \\
+    \dest{value} $v_s$ & what position $s$ contributes once attended \\
+  \end{tabular}
+\end{frame}
+
+\begin{frame}{Three questions a careful reader asks}
+  \textbf{Why not $h_t\T h_s$ directly?} The dot product is symmetric; relevance is not
+  (a verb looks for its subject). With $W_Q, W_K$ the score is $h_t\T(W_QW_K\T)h_s$: a
+  general bilinear form of rank $\le d_k$, at $2dd_k$ parameters instead of $d^2$.
+
+  \vspace{0.7em}
+  \textbf{Why separate values from keys?} ``What makes $s$ worth attending to'' and ``what
+  $s$ contributes'' are different information. Key: \emph{I am a noun in subject position}.
+  Value: \emph{I am plural}.
+
+  \vspace{0.7em}
+  \textbf{Why a dot product and not an MLP on $(h_t,h_s)$?} Bahdanau et al.\ (2015) used
+  $w\T\tanh(W_1h_t + W_2h_s)$. The dot product, for all $(t,s)$ at once, is \emph{one}
+  matrix product $QK\T$ --- the most optimized operation on a GPU. Requirement 2 decides.
+\end{frame}
+
+\begin{frame}{The soft-dictionary reading}
+  \begin{center}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    & Python \texttt{dict} & attention \\
+    \midrule
+    match & key $=$ query, exactly & $q\T k$, graded \\
+    result & the one value & convex combination of all values \\
+    one key dominates & --- & nearly a hard lookup \\
+    several match equally & error & their average \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{1em}
+  Everything attention can do is a \dest{differentiable, parallel, associative memory
+  lookup}.
+\end{frame}
+
+\begin{frame}{The $\sqrt{d_k}$ scaling: a one-line variance calculation}
+  \begin{block}{Proposition}
+    If $q,k\in\R^{d_k}$ have independent components with mean 0 and variance 1, then
+    $\E[q\T k] = 0$ and $\operatorname{Var}[q\T k] = d_k$.
+  \end{block}
+
+  \vspace{0.5em}
+  \emph{Proof.} $q\T k = \sum_i q_ik_i$; each term has mean 0 and variance
+  $\E[q_i^2]\E[k_i^2] = 1$; the $d_k$ terms are independent. $\square$
+
+  \vspace{0.8em}
+  At initialization the raw scores have standard deviation $\sqrt{d_k}$: $\approx 8$ for
+  $d_k = 64$, $32$ for $d_k = 1024$. A softmax of entries differing by tens is a one-hot
+  vector.
+\end{frame}
+
+\begin{frame}{Why a saturated softmax is fatal}
+  Jacobian of the softmax (notes, A.2):
+  \[
+    \frac{\partial a_i}{\partial s_j} = a_i\,(\delta_{ij} - a_j),\qquad
+    J\T g = a\odot\big(g - \langle a,g\rangle\mathbf{1}\big).
+  \]
+
+  \vspace{0.6em}
+  If $a\approx e_k$: for $j\neq k$ the factor $a_j\approx 0$; for $j = k$,
+  $g_k - \langle a,g\rangle\approx 0$. \dest{Every coordinate of the gradient vanishes.}
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item No gradient reaches $W_Q, W_K$: the pattern never leaves its random initial state.
+    \item Dividing by $\sqrt{d_k}$ brings the scores back to unit variance --- the
+          responsive regime.
+  \end{itemize}
+
+  \vspace{0.5em}
+  \hook{General lesson: the scale of every intermediate quantity must be controlled ---
+  by normalization, initialization, or constants like this one. Module 3 returns to it.}
+\end{frame}
+
+\begin{frame}{The causal mask}
+  Position $t$ predicts $x_{t+1}$; if it could read $x_{t+1}$ it would copy it and learn
+  nothing. Impose the constraint before the softmax:
+  \[
+    \tilde s_{ts} = \begin{cases} s_{ts} & s\le t\\ -\infty & s > t\end{cases}
+    \qquad\Longrightarrow\qquad e^{-\infty} = 0 \text{ in numerator and denominator.}
+  \]
+
+  \vspace{0.6em}
+  \begin{itemize}
+    \item Exactly the sum over $s\le t$ of the first slide --- but computed for all positions
+          at once by one matrix operation.
+    \item In code: a lower-triangular matrix of ones; $-\infty$ is a large negative float.
+    \item One forward pass yields all $n$ conditional distributions: \dest{teacher forcing}.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{The prefix property}
+  \begin{block}{Proposition}
+    A network built from position-wise maps and causally masked attention has the property
+    that its output at position $t$ is a function of $x_1,\dots,x_t$ only. Consequently,
+    its output at $t$ on $x_{1:n}$ equals its output at $t$ on the prefix $x_{1:t}$.
+  \end{block}
+
+  \vspace{0.5em}
+  \emph{Proof.} Induction over layers; a masked layer at $t$ reads only $q_t$ and
+  $k_s, v_s$ for $s\le t$, themselves functions of $x_{1:t}$. Truncating after $t$ changes
+  nothing. $\square$
+
+  \vspace{0.8em}
+  The second claim buys two things:
+  \begin{itemize}
+    \item \textbf{generation is consistent with training}: fed its own prefix, the model
+          computes exactly the distributions it was trained on;
+    \item \textbf{the KV cache is valid} (Module 7): past keys and values never change.
+  \end{itemize}
+
+  \vspace{0.3em}
+  \hook{No mask = bidirectional (BERT). Queries from one sequence, keys/values from another
+  = cross-attention. Week 3.}
+\end{frame}
+
+\begin{frame}{Matrix form}
+  Stack the $n$ inputs as rows of $H\in\R^{n\times d}$:
+  \[
+    Q = HW_Q,\qquad K = HW_K,\qquad V = HW_V,
+  \]
+  \[
+    \boxed{\;\mathrm{Attention}(Q,K,V) = \sm\!\Big(\frac{QK\T}{\sqrt{d_k}} + M\Big)\,V
+    \;\in\R^{n\times d_v}\;}
+  \]
+  $M_{ts} = 0$ for $s\le t$, $-\infty$ otherwise; softmax along each row.
+
+  \vspace{0.8em}
+  $A = \sm(QK\T/\sqrt{d_k} + M)\in\R^{n\times n}$ is the \dest{attention matrix}:\\
+  lower triangular, each row a probability distribution over $\{1,\dots,t\}$.
+\end{frame}
+
+\begin{frame}{Shapes --- every bug in Lab 2 will be a shape bug}
+  \begin{center}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    operation & shapes & result \\
+    \midrule
+    projections & $(n\times d)(d\times d_k)$ & $n\times d_k$ \\
+    scores $QK\T$ & $(n\times d_k)(d_k\times n)$ & $n\times n$ \\
+    output $AV$ & $(n\times n)(n\times d_v)$ & $n\times d_v$ \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{1em}
+  With a batch dimension $B$ in front (\texttt{[B, n, d]}), PyTorch broadcasts the matrix
+  products over it. With heads: \texttt{[B, h, n, d/h]}.
+\end{frame}
+
+\begin{frame}{Multi-head attention: why}
+  One attention layer gives each position \emph{one} pattern over the past.
+
+  \vspace{0.6em}
+  A position may need several things at once: the previous token, the subject of the
+  sentence, an open bracket. One softmax cannot concentrate on two positions without
+  blurring both.
+
+  \vspace{0.8em}
+  Fix: run $h$ attentions in parallel, each with its own projections and reduced
+  dimension $d_k = d_v = d/h$, and concatenate:
+  \[
+    \mathrm{head}_i = \mathrm{Attention}(HW_Q^{(i)}, HW_K^{(i)}, HW_V^{(i)}),\qquad
+    \MHA(H) = [\mathrm{head}_1\mid\cdots\mid\mathrm{head}_h]\,W_O .
+  \]
+  Each head: its own $A^{(i)}\in\R^{n\times n}$, its own $d/h$-dimensional subspace to read
+  and write. $W_O\in\R^{d\times d}$ mixes the heads back into the stream.
+\end{frame}
+
+\begin{frame}{Multi-head attention: cost and layout}
+  \[
+    \#\text{params}(\MHA) = \underbrace{3d^2}_{W_Q,W_K,W_V} + \underbrace{d^2}_{W_O} = 4d^2
+    \qquad\text{--- independent of } h.
+  \]
+
+  \vspace{0.6em}
+  \begin{itemize}
+    \item The $h$ heads' projections side by side form $W_Q\in\R^{d\times d}$ (same for
+          $K$, $V$): in code, \emph{one} $d\times 3d$ product and a reshape. Never a loop
+          over heads.
+    \item $h$ trades the dimension of each head against the number of patterns.
+  \end{itemize}
+
+  \vspace{0.6em}
+  \begin{center}
+  \begin{tabular}{@{}lrrr@{}}
+    \toprule
+    & $d$ & $h$ & $d/h$ \\
+    \midrule
+    GPT-2 small & 768 & 12 & 64 \\
+    GPT-3 175B & 12{,}288 & 96 & 128 \\
+    Llama 3 (all sizes) & 4{,}096--16{,}384 & 32--128 & 128 \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \hook{Per-head dimension stays fixed; the number of heads grows with $d$. GQA: Week 3.}
+\end{frame}
+
+\begin{frame}{What attention does not know: position}
+  \begin{block}{Proposition (permutation equivariance)}
+    For a permutation matrix $P$ and \emph{unmasked} attention,
+    $\mathrm{Attention}(PH) = P\,\mathrm{Attention}(H)$.
+  \end{block}
+
+  \vspace{0.5em}
+  \emph{Proof.} $Q' = PQ$, $K' = PK$, $V' = PV$; $S' = PSP\T$; row-wise softmax commutes
+  with simultaneous row/column permutation; $A'V' = PAP\T PV = PAV$. $\square$
+
+  \vspace{0.8em}
+  Position-wise maps are equivariant too, so the whole network processes a \emph{set}:\\
+  ``o gato mordeu o cão'' $\equiv$ ``o cão mordeu o gato'', up to permutation of outputs.
+
+  \vspace{0.5em}
+  \dest{Something has to break the symmetry.}
+\end{frame}
+
+\begin{frame}{Positional information, option 1: learned absolute}
+  GPT-2, BERT: a second table $P\in\R^{n_{\max}\times d}$; feed $x_t + p_t$ to layer 1.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item Simple, works.
+    \item No row $p_{n_{\max}+1}$: cannot process longer sequences at all.
+    \item Must learn separately, for each pair of positions, how far apart they are.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Option 2: sinusoidal (Vaswani et al.\ 2017)}
+  A fixed table, a bank of $d/2$ sinusoids with geometrically spaced frequencies:
+  \[
+    p_{t,2i} = \sin(\omega_it),\qquad p_{t,2i+1} = \cos(\omega_it),\qquad
+    \omega_i = 10000^{-2i/d}.
+  \]
+  Wavelengths from $2\pi$ to $2\pi\cdot 10^4$ --- a clock with $d/2$ dials of increasing
+  period.
+
+  \vspace{0.8em}
+  The property that learned tables lack (notes, A.3): for every $\omega_i$ and offset $k$,
+  \[
+    \begin{pmatrix}\sin\omega_i(t+k)\\ \cos\omega_i(t+k)\end{pmatrix}
+    = \underbrace{\begin{pmatrix}\cos\omega_ik & \sin\omega_ik\\ -\sin\omega_ik & \cos\omega_ik\end{pmatrix}}_{\text{rotation by }\omega_ik,\ \text{independent of }t}
+    \begin{pmatrix}\sin\omega_it\\ \cos\omega_it\end{pmatrix}.
+  \]
+  Position $t+k$ is a fixed linear function of position $t$.
+\end{frame}
+
+\begin{frame}{From sinusoids to RoPE (preview of Week 3)}
+  \begin{itemize}
+    \item Sinusoids are \emph{added} to the embeddings and then multiplied by $W_Q, W_K$:
+          $q_t\T k_s$ contains cross terms between content and position. The relative
+          property is weakened.
+    \item \dest{RoPE} applies the rotation to $q$ and $k$ themselves, so that
+          $q_t\T k_s$ depends on $t - s$ exactly. The $2\times 2$ rotation above is literally
+          its building block.
+  \end{itemize}
+
+  \vspace{1em}
+  \hook{Remark: the causal mask already breaks the symmetry partially (position $t$ sees
+  $t$ keys). Haviv et al.\ (2022): decoders with no positional encoding at all learn
+  competitive LMs. Encodings make position easy, not possible.}
+\end{frame}
+
+\begin{frame}{The cost of attention: FLOPs}
+  Per head, $QK\T$ and $AV$ each cost $n\cdot n\cdot d_k$ multiply-adds; over $h$ heads
+  with $hd_k = d$ (a multiply-add = 2 FLOPs):
+  \[
+    \text{FLOPs}(QK\T) + \text{FLOPs}(AV) \approx 4n^2d .
+  \]
+  Projections: $8nd^2$. MLP of the block (Section 3): $16nd^2$. Per layer:
+  \[
+    \boxed{\;24\,nd^2 \;+\; 4\,n^2d\;}
+  \]
+
+  \vspace{0.6em}
+  Quadratic term dominates when $4n^2d > 24nd^2$, i.e.\ \dest{$n > 6d$}.
+  \begin{itemize}
+    \item GPT-2 small ($d = 768$): crossover at $n\approx 4600$, beyond its context of 1024;
+          at $n = 1024$ the $n^2$ term is $\sim\!18\%$ of the total.
+    \item $d = 4096$: crossover at $n\approx 25{,}000$.
+  \end{itemize}
+  ``Attention is quadratic and therefore dominates'': false for short contexts, true for
+  long ones. Where the line is depends on $d$.
+\end{frame}
+
+\begin{frame}{The cost of attention: memory is the immediate problem}
+  A naive implementation materializes $A\in\R^{h\times n\times n}$ per layer and per
+  sequence, and keeps it for the backward pass.
+
+  \vspace{0.6em}
+  \begin{center}
+  \begin{tabular}{@{}lrr@{}}
+    \toprule
+    $h = 12$, fp32 & $n = 1024$ & $n = 8192$ \\
+    \midrule
+    per layer, per sequence & 48 MB & 3 GB \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.6em}
+  At $n = 8192$, one layer's attention matrix for one sequence exceeds the parameters of the
+  whole model. Lab 2 measures this growth.
+
+  \vspace{0.8em}
+  \dest{FlashAttention} (Dao et al.\ 2022; Week 4): same output, never materializes $A$ ---
+  tiles the softmax and normalizes on the fly. $O(n^2)$ time stays; $O(n^2)$ memory goes;
+  avoiding the trip to GPU memory makes it much faster in practice.
+
+  \vspace{0.4em}
+  \hook{Hook for Modules 3 and 7: at inference with a KV cache, one new token costs $O(nd)$
+  in attention; the problem becomes the cache's memory, $2Lnd$ numbers per sequence.}
+\end{frame}
+
+% =====================================================================
+\section{The Transformer block}
+
+\begin{frame}{Attention mixes positions; everything else is position-wise}
+  \begin{itemize}
+    \item Most parameters and most FLOPs are in the ``everything else''.
+    \item Four components; taken in the order they were \emph{understood}, not the order in
+          the code.
+  \end{itemize}
+
+  \vspace{1em}
+  \begin{center}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    component & acts on & role \\
+    \midrule
+    residual connection & the stream & identity path; makes depth trainable \\
+    layer normalization & each position & controls scale \\
+    MLP & each position & processes what attention gathered \\
+    attention & across positions & the only coupling between positions \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+\end{frame}
+
+\begin{frame}{The residual stream}
+  Each component $f$ is applied as $h\leftarrow h + f(h)$, not $h\leftarrow f(h)$
+  (He et al.\ 2016). Unrolled over the $2L$ sublayers:
+  \[
+    h^{(\mathrm{out})}_t = x_t + p_t + \sum_{l=1}^{2L} f_l\big(h^{(l-1)}\big)_t .
+  \]
+
+  \vspace{0.6em}
+  \begin{block}{}
+    The vector at position $t$ is a running sum --- the \dest{residual stream} --- to which
+    every sublayer \emph{adds} a contribution. No sublayer transforms the stream; each one
+    reads from it and writes into it.
+  \end{block}
+
+  \vspace{0.6em}
+  Consequence: the stream has fixed width $d$ throughout. $W_O$ and the MLP's $W_2$ exist
+  to map back into it.
+\end{frame}
+
+\begin{frame}{Why residuals matter, twice}
+  \textbf{Optimization.} The Jacobian of $h\mapsto h + f(h)$ is $I + \partial f/\partial h$.
+  The gradient to any early layer contains a term that passes through all the identities,
+  undamped, however badly conditioned the $f_l$ are. Networks of this depth were not
+  trainable before.
+
+  \vspace{1em}
+  \textbf{Interpretation.} Because the stream is a sum, one can ask what each sublayer
+  \emph{added} --- and, via the unembedding, which logits each attention head or MLP pushed.
+  Section 4 uses this.
+\end{frame}
+
+\begin{frame}{Layer normalization}
+  Standardize each position's vector across its $d$ coordinates (Ba, Kiros \& Hinton 2016):
+  \[
+    \LN(h) = \gamma\odot\frac{h - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta,\qquad
+    \mu = \frac1d\sum_i h_i,\quad \sigma^2 = \frac1d\sum_i(h_i - \mu)^2 .
+  \]
+
+  \vspace{0.6em}
+  \begin{itemize}
+    \item Statistics \emph{per token}, over features: independent of batch and sequence
+          length (unlike batch norm --- hence LN for sequences).
+    \item Scale invariant: $\LN(\alpha h) = \LN(h)$ for $\alpha > 0$.
+    \item Gradient through it scales as $1/\sigma$ (notes, A.4): larger activations get
+          smaller gradients --- self-stabilizing.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Pre-norm vs.\ post-norm}
+  \begin{center}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    & update & identity path \\
+    \midrule
+    post-norm (Vaswani 2017) & $h\leftarrow\LN(h + f(h))$ & interrupted $2L$ times \\
+    pre-norm (GPT-2 and after) & $h\leftarrow h + f(\LN(h))$ & unbroken \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{1em}
+  Looks cosmetic; is not. Xiong et al.\ (2020): post-norm needs learning-rate warmup to
+  train at all; pre-norm does not.
+
+  \vspace{0.8em}
+  Default in these notes and in the labs: \dest{pre-norm}.\\
+  \hook{Week 3: RMSNorm --- drop $\mu$ and $\beta$, normalize by the root mean square.}
+\end{frame}
+
+\begin{frame}{The position-wise MLP}
+  Same two-layer network at every position:
+  \[
+    \MLP(h) = W_2\,\sigma(W_1h + b_1) + b_2,\qquad W_1\in\R^{4d\times d},\quad W_2\in\R^{d\times 4d}.
+  \]
+  Hidden width $4d$ by convention; $\sigma = $ GELU, $x\,\Phi(x)$, a smooth ReLU.
+
+  \vspace{0.8em}
+  \[
+    \#\text{params}(\MLP) = 4d\cdot d + d\cdot 4d = 8d^2 \qquad\text{--- twice attention.}
+  \]
+
+  \vspace{0.6em}
+  Two thirds of the non-embedding parameters are in the MLPs; two thirds of the FLOPs too
+  ($16nd^2$ vs.\ $8nd^2$ for the attention projections).\\
+  Applied independently per position = a $1\times 1$ convolution; cost linear in $n$.
+\end{frame}
+
+\begin{frame}{The MLP as a key--value memory}
+  Rows of $W_1$: keys $\kappa_1,\dots,\kappa_{4d}\in\R^d$. Columns of $W_2$: values
+  $\nu_1,\dots,\nu_{4d}\in\R^d$. Then
+  \[
+    \MLP(h) = \sum_{j=1}^{4d}\sigma\big(\kappa_j\T h + b_{1,j}\big)\,\nu_j .
+  \]
+
+  \vspace{0.6em}
+  Each hidden unit tests the input against a key and, if it matches, adds its value to the
+  stream (Geva et al.\ 2021).
+
+  \vspace{0.8em}
+  \begin{center}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    & keys & looks up \\
+    \midrule
+    attention & computed from the context & the current sequence \\
+    MLP & learned, input-independent & patterns seen in training \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.4em}
+  \hook{Factual knowledge edited in a model (Meng et al.\ 2022) is found in middle-layer
+  MLPs.}
+\end{frame}
+
+\begin{frame}{The block}
+  \begin{columns}[T]
+  \begin{column}{0.48\textwidth}
+    \vspace{0.5em}
+    Pre-norm, decoder-only:
+    \begin{align*}
+      H &\leftarrow H + \MHA\big(\LN_1(H)\big)\\
+      H &\leftarrow H + \MLP\big(\LN_2(H)\big)
+    \end{align*}
+    MHA causally masked; MLP row by row.
+
+    \vspace{1em}
+    Per block: $4d^2 + 8d^2 = 12d^2$ weights, $+\,O(d)$.
+  \end{column}
+  \begin{column}{0.5\textwidth}
+    \centering
+    \begin{tikzpicture}[node distance=0.35cm]
+      \node (in) {$H$};
+      \node[box, above=of in] (ln1) {$\LN_1$};
+      \node[box, above=of ln1] (att) {causal MHA};
+      \node[op, above=of att] (p1) {$+$};
+      \node[box, above=of p1] (ln2) {$\LN_2$};
+      \node[box, above=of ln2] (mlp) {MLP};
+      \node[op, above=of mlp] (p2) {$+$};
+      \node[above=of p2] (out) {$H'$};
+      \draw[arr] (in) -- (ln1); \draw[arr] (ln1) -- (att); \draw[arr] (att) -- (p1);
+      \draw[arr] (p1) -- (ln2); \draw[arr] (ln2) -- (mlp); \draw[arr] (mlp) -- (p2);
+      \draw[arr] (p2) -- (out);
+      \draw[arr] (in.east) -- ++(1.6,0) |- (p1.east);
+      \draw[arr] (p1.east) -- ++(1.6,0) |- (p2.east);
+      \node[right=1.7cm of att, font=\small, text=gray!70!black] {residual stream};
+    \end{tikzpicture}
+  \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{The full model}
+  Inputs $x_{1:n}$:
+  \begin{enumerate}
+    \item \textbf{Embed:} $H^{(0)} = E[x_{1:n}] + P[1{:}n]\in\R^{n\times d}$.
+    \item \textbf{Blocks:} $H^{(l)} = \mathrm{Block}_l(H^{(l-1)})$, $l = 1,\dots,L$.
+    \item \textbf{Final norm, unembed:} $Z = \LN_f(H^{(L)})\,U\T\in\R^{n\times V}$;
+          row $t$ = logits for $x_{t+1}$.
+    \item \textbf{Loss:} $\Lc = -\frac1n\sum_t\log\sm(Z_t)_{x_{t+1}}$ --- Week 1's
+          cross-entropy, averaged over positions.
+  \end{enumerate}
+
+  \vspace{0.6em}
+  \begin{center}
+  \begin{tabular}{@{}lrrrrr@{}}
+    \toprule
+    & $V$ & $n_{\max}$ & $d$ & $L$ & $h$ \\
+    \midrule
+    GPT-2 small & 50{,}257 & 1{,}024 & 768 & 12 & 12 \\
+    GPT-2 XL & 50{,}257 & 1{,}024 & 1{,}600 & 48 & 25 \\
+    Llama 3 8B & 128{,}256 & 8{,}192 & 4{,}096 & 32 & 32 \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \hook{The reference implementation (notes, Appendix B) is 70 lines of PyTorch.}
+\end{frame}
+
+\begin{frame}{Counting parameters}
+  \[
+    N \;\approx\; \underbrace{12\,L\,d^2}_{\text{blocks}} + \underbrace{Vd}_{\text{embedding}}
+    + \underbrace{n_{\max}d}_{\text{positions}}\qquad\text{(unembedding tied)}
+  \]
+
+  \vspace{0.6em}
+  \begin{center}
+  \begin{tabular}{@{}lrrrrr@{}}
+    \toprule
+    & $12Ld^2$ & $Vd$ & $n_{\max}d$ & total & published \\
+    \midrule
+    GPT-2 small & 84.9M & 38.6M & 0.8M & 124.3M & 124M \\
+    GPT-2 XL & 1{,}475M & 80.4M & 1.6M & 1{,}557M & 1.5B \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.8em}
+  Exact enough to plan a model with.
+\end{frame}
+
+\begin{frame}{Two readings of the formula}
+  \textbf{Embedding share.} $Vd$ is linear in $d$, $12Ld^2$ quadratic: the embedding is
+  31\% of GPT-2 small, 5\% of GPT-2 XL, $<2\%$ of Llama 3 70B.\\
+  Scaling-law papers report \dest{non-embedding} parameters, $12Ld^2$, for this reason.
+
+  \vspace{1em}
+  \textbf{Depth vs.\ width.} $Ld^2$: doubling $d$ costs $4\times$, doubling $L$ costs
+  $2\times$. The aspect ratio $d/L$ of trained models stays in a narrow band
+  (64 for GPT-2 small, 128 for Llama 3 8B): near-optimal over a wide range for a fixed
+  budget (Kaplan et al.\ 2020).
+\end{frame}
+
+\begin{frame}{Counting FLOPs: two per parameter per token}
+  Forward pass, summing Section 2's per-layer count over layers, adding the unembedding,
+  ignoring the $n^2$ term for $n < 6d$:
+  \[
+    \text{FLOPs}_{\mathrm{fwd}} \approx 24Lnd^2 + 2nVd = 2n\,(12Ld^2 + Vd) \approx 2\,n\,N .
+  \]
+
+  \vspace{0.6em}
+  Every weight is used once per token in a matrix--vector product: one multiply, one add.
+
+  \vspace{0.8em}
+  Backward $\approx 2\times$ forward (gradient w.r.t.\ activations, gradient w.r.t.\
+  weights --- notes, A.5), so training $N$ parameters on $D$ tokens costs
+  \[
+    \boxed{\;C\approx 6\,N\,D\;}
+  \]
+
+  \vspace{0.4em}
+  GPT-2 small on $10^{10}$ tokens: $7.4\times 10^{18}$ FLOPs $\approx$ 5 h of one H100 at
+  40\% utilization.\\
+  \hook{Lab 4 measures the utilization; Week 5 uses $C = 6ND$ as the scaling-law budget.}
+\end{frame}
+
+\begin{frame}{Training is parallel}
+  The Transformer did not displace the LSTM by being more expressive. It displaced it by
+  the shape of its computation.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item One forward pass on $x_{1:n}$ gives $\ptheta(\cdot\mid x_{1:t})$ for every $t$ at
+          once (prefix property). Loss: row $t$ vs.\ $x_{t+1}$ --- the input shifted by one.
+    \item No sequential dependency between positions: the sequence dimension is as parallel
+          as the batch dimension.
+    \item An RNN computes $h_t$ from $h_{t-1}$: wall-clock $\Omega(n)$ per sequence,
+          regardless of processors.
+  \end{itemize}
+
+  \vspace{0.6em}
+  \hook{Teacher forcing's known cost --- exposure bias: at generation the model conditions
+  on its own outputs, never seen in training. Module 6 is partly about correcting this.}
+\end{frame}
+
+\begin{frame}{Generation is sequential}
+  $x_{n+1}$ must be drawn before $x_{n+2}$ can be conditioned on it.
+
+  \vspace{0.6em}
+  Naively: a full forward pass per token; $m$ tokens after a prompt of length $n$ cost
+  \[
+    \sum_{t=n}^{n+m} O(td^2 + t^2d)\qquad\text{--- cubic in the length.}
+  \]
+
+  \vspace{0.6em}
+  Rescue: the prefix property. Past keys and values never change, so \dest{cache them};
+  each new token costs one position's projections plus one query against the cache,
+  $O(d^2 + nd)$ per layer.
+
+  \vspace{0.8em}
+  That is the \dest{KV cache}. Its memory, $2Lnd$ numbers per sequence, is what limits
+  batch size and context at serving time (Module 7).
+\end{frame}
+
+% =====================================================================
+\section{What attention learns}
+
+\begin{frame}{Looking inside}
+  The stream is a sum; each head writes through its own $W_O^{(i)}$. So heads can be
+  inspected one at a time: by their pattern $A^{(i)}$ and by what they add.
+
+  \vspace{1em}
+  \textbf{Positional heads} (early layers of GPT-2): attend almost exclusively to the
+  previous token (sharp sub-diagonal in $A$), to the first token, or to the token itself.
+
+  \vspace{0.6em}
+  A previous-token head builds bigram-like features: after it, position $t$ carries
+  $x_{t-1}$ as well as $x_t$. One such head per layer: $L$ layers assemble features of the
+  last $L$ tokens --- \dest{the $n$-gram window, reconstructed}.
+\end{frame}
+
+\begin{frame}{Induction heads (Elhage et al.\ 2021; Olsson et al.\ 2022)}
+  Sequence: \quad $\dots\ \texttt{A}\ \texttt{B}\ \dots\ \texttt{A}\ \underline{\ ?\ }$
+
+  \vspace{0.6em}
+  An \dest{induction head} attends from the current \texttt{A} to the token \emph{after}
+  the previous \texttt{A} --- that is, to \texttt{B} --- and copies it into the prediction.
+
+  \vspace{0.8em}
+  Two heads, two layers:
+  \begin{enumerate}
+    \item a previous-token head writes ``my predecessor was \texttt{A}'' into the stream at
+          the old \texttt{B};
+    \item a later head with query ``I am \texttt{A}'' and keys reading ``my predecessor was
+          \texttt{A}'' attends there and copies the token identity out.
+  \end{enumerate}
+
+  \vspace{0.6em}
+  No $n$-gram can do this: arbitrary distance, and \texttt{AB} need never have occurred in
+  training. The simplest form of \dest{in-context learning}; the ability jumps in training
+  exactly when induction heads form.
+\end{frame}
+
+\begin{frame}{Attention sinks, and the moral}
+  \textbf{Attention sinks} (Xiao et al.\ 2023). In most trained models a large share of
+  every head's mass goes to the first token, whatever it is. A softmax must put its mass
+  somewhere even when nothing is relevant; the first token, visible to all, is the dump.
+  Evict it from the KV cache and the model degrades sharply.
+
+  \vspace{1.2em}
+  \begin{block}{The moral for this lecture}
+    The components of Sections 2 and 3 are not ``a function approximator''. They have
+    identifiable algorithmic roles --- lookup by content, copying, composition across layers
+    --- and these are exactly the operations the $n$-gram lacked.
+  \end{block}
+\end{frame}
+
+% =====================================================================
+\section{Bridge}
+
+\begin{frame}{Lab 2 (M2P2), this week}
+  In plain PyTorch:
+  \begin{enumerate}
+    \item Scaled dot-product attention with a causal mask, from the boxed formula; check
+          against \texttt{F.scaled\_dot\_product\_attention}.
+    \item Multi-head causal self-attention in the one-product-plus-reshape layout; check
+          numerically against \texttt{nn.MultiheadAttention} with the same weights.
+    \item The pre-norm block and a parameter counter that reproduces $12Ld^2 + Vd + n_{\max}d$
+          for GPT-2's four sizes.
+    \item Memory and time of the attention layer vs.\ $n$: confirm $n^2$, find where the naive
+          implementation runs out of memory.
+  \end{enumerate}
+
+  \vspace{0.6em}
+  Lab 3 stacks the block into a $\sim$10M-parameter GPT, trained on the Lab 1 corpus,
+  evaluated in bits per byte against the $n$-gram baseline.
+\end{frame}
+
+\begin{frame}{Week 3}
+  Replace the pieces of the block, one by one, with their current versions:
+  \begin{center}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    today & Week 3 & motivation \\
+    \midrule
+    LayerNorm & RMSNorm & cheaper, same effect \\
+    GELU MLP, $8d^2$ & SwiGLU, three matrices & quality per parameter \\
+    learned positions & RoPE & relative positions, extrapolation \\
+    $h$ KV heads & GQA: fewer KV heads & KV-cache memory \\
+    biases & none & simplicity \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.8em}
+  Then the three families (encoder / decoder / encoder--decoder: a question about the mask
+  and the objective, not the block), and the escapes from $n^2$ (linear attention, SSMs)
+  and from $12Ld^2$ (mixture of experts).
+\end{frame}
+
+\begin{frame}{Exercises (due with Lab 2) --- see the notes for the full statements}
+  \begin{enumerate}
+    \item Scaling with non-unit variances; why $\sqrt{d_k}$ is kept fixed anyway.
+    \item Softmax Jacobian; $J\T g\to 0$ as $a\to$ one-hot.
+    \item Prefix property: which of LN, batch norm, centered/shifted convolutions, dropout
+          break it?
+    \item Equivariance: complete the proof; show masked attention is not equivariant; how a
+          causal model recovers position without encodings.
+    \item Parameter and FLOP counts for GPT-2 medium/large and Llama 3 8B; the $n^2$ crossover.
+    \item A bigram model in one attention head; a trigram with a previous-token head + MLP.
+    \item Memory of attention matrices for $L = h = 32$, batch 16, bf16: when is it 80 GB?
+    \item Discussion: parallelism vs.\ expressivity --- Transformer vs.\ RNN.
+  \end{enumerate}
+\end{frame}
+
+% =====================================================================
+\section{Appendix: code}
+
+\begin{frame}[fragile]{Causal self-attention (notes, B.1) --- the core}
+\begin{lstlisting}[style=py]
+B, n, d = x.shape
+q, k, v = self.qkv(x).split(d, dim=-1)          # one d x 3d product
+q = q.view(B, n, self.h, self.dk).transpose(1, 2)   # [B, h, n, dk]
+k = k.view(B, n, self.h, self.dk).transpose(1, 2)
+v = v.view(B, n, self.h, self.dk).transpose(1, 2)
+
+s = (q @ k.transpose(-2, -1)) / math.sqrt(self.dk)  # [B, h, n, n]
+s = s.masked_fill(~self.mask[:, :, :n, :n], float("-inf"))
+a = F.softmax(s, dim=-1)                            # rows sum to 1
+y = a @ v                                           # [B, h, n, dk]
+y = y.transpose(1, 2).contiguous().view(B, n, d)    # concatenate heads
+return self.proj(y)                                 # W_O
+\end{lstlisting}
+  \vspace{0.3em}
+  The four lines from \texttt{s = ...} to \texttt{y = a @ v} are the boxed formula.
+  In production: \texttt{F.scaled\_dot\_product\_attention(q, k, v, is\_causal=True)}.
+\end{frame}
+
+\begin{frame}[fragile]{Block and model (notes, B.2)}
+\begin{lstlisting}[style=py]
+class Block(nn.Module):
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))      # mixes positions
+        x = x + self.mlp(self.ln2(x))       # position-wise
+        return x
+
+class GPT(nn.Module):
+    def forward(self, idx, targets=None):   # idx: [B, n]; targets: idx shifted by one
+        pos = torch.arange(idx.size(1), device=idx.device)
+        x = self.tok_emb(idx) + self.pos_emb(pos)
+        for block in self.blocks:
+            x = block(x)
+        logits = self.head(self.ln_f(x))    # [B, n, V]; head.weight is tok_emb.weight
+        if targets is None:
+            return logits, None
+        return logits, F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+\end{lstlisting}
+  \texttt{GPT(50257, 1024, 768, 12, 12)} has 124.4M parameters. The structure of these
+  20 lines has been stable since 2019.
+\end{frame}
+
+\begin{frame}{Proofs in the notes}
+  \begin{itemize}
+    \item \textbf{A.1} Gradient of the cross-entropy w.r.t.\ the logits: $p - e_y$.
+    \item \textbf{A.2} Jacobian of the softmax; vanishing under saturation.
+    \item \textbf{A.3} Sinusoidal positions: the shift by $k$ is a $t$-independent rotation;
+          $p_t\T p_{t+k}$ depends on $k$ only.
+    \item \textbf{A.4} Scale invariance of LN and its Jacobian
+          $\frac1\sigma\big(I - \frac1d\mathbf 1\mathbf 1\T - \frac1d\hat h\hat h\T\big)$;
+          effective learning rate $\eta/\|W\|^2$.
+    \item \textbf{A.5} Why backward $= 2\times$ forward: $GW\T$ and $X\T G$.
+  \end{itemize}
+\end{frame}
+
+\end{document}

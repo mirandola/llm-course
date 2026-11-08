@@ -8,3 +8,4 @@ Beamer decks, one per lecture. The LaTeX sources are in the repository under `sl
 | Week | Lecture | PDF |
 |:--:|:---|:---|
 | 1 | Language modeling, perplexity and tokenization | [M1P1_lecture_slides.pdf](M1P1_lecture_slides.pdf) |
+| 2 | Embeddings, attention and the Transformer block | [M2P1_lecture_slides.pdf](M2P1_lecture_slides.pdf) |

@@ -9,6 +9,7 @@ proofs in an appendix and reference code; the slides follow the same sections.
 | Week | Module | Notes |
 |:--:|:--:|:---|
 | 1 | 1 | [Language modeling, perplexity and tokenization](M1P1.qmd) |
-| 2 | 2 | *Embeddings and attention* — coming |
+| 2 | 2 | [Embeddings, attention and the Transformer block](M2P1.qmd) |
+| 3 | 2 | *The Llama recipe; the three families* — coming |
 
 Notes for later weeks are added as the course goes on.
