@@ -662,6 +662,8 @@ The functions below are the skeleton of Lab 1. They are written for clarity, not
 
 ## B.1 Interpolated $n$-gram model {#b.1-interpolated-n-gram-model .unnumbered}
 
+The code below interpolates orders $1,\dots,n$ with fixed weights. One detail matters on real data: interpolation alone still assigns probability zero to a token that never occurred in the training set *at all*, since every order, including the unigram, has count zero for it, and one such token in the test set makes the perplexity infinite (Pitfall 3). The lab therefore adds a small add-$\alpha$ floor to the unigram only, $\hat p_1(w) = (c(w)+\alpha)/(N+\alpha V)$, which costs nothing at the higher orders and guarantees that every token in the vocabulary has positive probability.
+
 ```python
 # n-gram model with interpolation smoothing (Jelinek-Mercer), orders 1..n.
 # Conventions:
