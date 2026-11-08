@@ -1,0 +1,658 @@
+---
+title: "Lab 1 — Byte-level BPE and an $n$-gram baseline"
+subtitle: "Module 1 · Lab (M1P2) · Week 1"
+author: "Heudson Mirandola"
+execute:
+  enabled: false
+---
+
+[![Open the student notebook in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mirandola/llm-course/blob/main/labs/M1P2_lab1_student.ipynb)
+This page shows the lab with solutions; students work in the notebook.
+
+
+## What you will build
+
+By the end of this lab you will have, in one notebook:
+
+1. a **byte-level BPE tokenizer** trained from scratch on a Portuguese corpus, with
+   GPT-2-style regex pre-tokenization;
+2. an **interpolated $n$-gram language model** ($n = 1, 2, 3$) over the tokens it produces,
+   with the interpolation weights tuned on a validation set;
+3. an **evaluation** that reports cross-entropy, perplexity **and bits per byte** on a
+   held-out test set --- the baseline that the Transformer of Lab 3 must beat;
+4. a **fertility measurement** (tokens per word) of your tokenizer and of GPT-2's, in
+   Portuguese and in English.
+
+Everything here follows the lecture notes (M1P1). Section numbers in the margin refer to
+them. The notes' Appendix B contains a reference implementation of parts 2 and 3 for a
+word-level toy corpus; here the same ideas run on real text over byte-level tokens.
+
+**Deliverable.** This notebook, executed top to bottom, plus the written exercises of the
+notes (Section "Exercises"), as a PDF.
+
+**Conventions.** `TODO` marks what you must write. Cells marked `# test` contain
+assertions that your code must pass; do not edit them. Timing hints are for Colab's free
+tier.
+
+```{python}
+#| label: setup
+import math, re, json, time, collections, random, urllib.request, pathlib
+from collections import Counter, defaultdict
+random.seed(0)
+```
+
+---
+
+## 0. The corpus
+
+Three novels by Machado de Assis, from Project Gutenberg: *Dom Casmurro* (1899),
+*Memórias Póstumas de Brás Cubas* (1881) and *Quincas Borba* (1891). About 1.3 MB of
+Portuguese in the orthography of the period (`elle`, `mettesse`, `tres`), which is
+irrelevant for everything we do here --- a tokenizer does not know what century it is.
+
+The cell below tries Gutenberg first and a GitHub mirror (GITenberg) second. Both are
+public domain.
+
+```{python}
+#| label: download
+BOOKS = {  # Gutenberg id -> (title, GITenberg repository)
+    55752: ("Dom Casmurro", "Dom-Casmurro_55752"),
+    54829: ("Memórias Póstumas de Brás Cubas", "Memorias-Posthumas-de-Braz-Cubas_54829"),
+    55682: ("Quincas Borba", "Quincas-Borba_55682"),
+}
+DATA = pathlib.Path("data"); DATA.mkdir(exist_ok=True)
+
+def fetch(gid, repo):
+    """Downloads one book as a str, trying Gutenberg (UTF-8) then GITenberg (Latin-1)."""
+    out = DATA / f"pg{gid}.txt"
+    if out.exists():
+        return out.read_text(encoding="utf-8")
+    sources = [
+        (f"https://www.gutenberg.org/cache/epub/{gid}/pg{gid}.txt", "utf-8"),
+        (f"https://raw.githubusercontent.com/GITenberg/{repo}/master/{gid}-8.txt", "latin-1"),
+    ]
+    for url, enc in sources:
+        try:
+            raw = urllib.request.urlopen(url, timeout=60).read()
+            text = raw.decode(enc)
+            out.write_text(text, encoding="utf-8")
+            return text
+        except Exception as e:
+            print(f"  {url}: {type(e).__name__}")
+    raise RuntimeError(f"could not download book {gid}")
+
+def strip_gutenberg(text):
+    """Keeps only the body between the *** START ... *** and *** END ... *** markers."""
+    start = text.index("***", text.index("*** START")) + 3
+    start = text.index("***", start) + 3          # end of the START line
+    end = text.index("*** END")
+    return text[start:end]
+
+books = {}
+for gid, (title, repo) in BOOKS.items():
+    t = strip_gutenberg(fetch(gid, repo)).replace("\r\n", "\n")
+    books[gid] = t
+    print(f"{title:36s} {len(t):8d} chars  {len(t.encode('utf-8')):8d} bytes")
+```
+
+**Split.** We concatenate the three books and cut the result into contiguous train /
+validation / test blocks (80 / 10 / 10 %), at paragraph boundaries. Contiguous, not
+shuffled: shuffling paragraphs would leak each book's vocabulary and style into the
+test set, and the test set is meant to be *new text*.
+
+```{python}
+#| label: split
+full = "\n\n".join(books.values())
+paragraphs = [p for p in full.split("\n\n") if p.strip()]
+n = len(paragraphs)
+train_text = "\n\n".join(paragraphs[: int(0.8 * n)])
+val_text   = "\n\n".join(paragraphs[int(0.8 * n) : int(0.9 * n)])
+test_text  = "\n\n".join(paragraphs[int(0.9 * n) :])
+for name, t in [("train", train_text), ("val", val_text), ("test", test_text)]:
+    print(f"{name:5s} {len(t.encode('utf-8')):8d} bytes")
+(DATA / "lab1_test.txt").write_text(test_text, encoding="utf-8")   # Lab 3 reuses it
+print(train_text[:400])
+```
+
+---
+
+## 1. Byte-level BPE
+
+*Notes, Section 4.3.* Three steps: pre-tokenize with a regex; convert each piece to bytes;
+merge the most frequent adjacent pair, repeatedly.
+
+### 1.1 Pre-tokenization
+
+GPT-2's regular expression. It needs the `regex` module (not `re`) because of the Unicode
+classes `\p{L}` and `\p{N}`. Colab has it installed.
+
+```{python}
+#| label: pretok
+import regex   # pip install regex
+
+GPT2_PATTERN = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+pretok = regex.compile(GPT2_PATTERN)
+
+def pre_tokenize(text):
+    """Splits text into pieces; merges will never cross a piece boundary."""
+    return pretok.findall(text)
+
+print(pre_tokenize("Uma noite destas, vindo da cidade para o Engenho Novo, 1899!"))
+```
+
+Look at the output: the space is attached to the *following* word (`" noite"`), the
+comma is a piece of its own, and the digits are separate from the letters.
+
+### 1.2 Training
+
+Representation: the corpus is a `Counter` from **piece** (as a tuple of symbols) to
+**frequency**. A symbol is an `int` in `0..255` at the start (a byte) and becomes a
+`bytes` object once merged; to keep one type, we represent every symbol as `bytes` of
+length $\ge 1$ from the start. Counting pairs over the *distinct* pieces, weighted by
+frequency, is what makes training fast: the corpus has ~1.3 M bytes but only a few tens
+of thousands of distinct pieces.
+
+```{python}
+#| label: bpe-train
+def to_bytes_tuple(piece):
+    """'ab' -> (b'a', b'b'); 'ã' -> (b'\\xc3', b'\\xa3') — one symbol per byte."""
+    return tuple(bytes([b]) for b in piece.encode("utf-8"))
+
+def count_pairs(corpus):
+    """corpus: Counter {tuple_of_symbols: freq}. Returns Counter {(a, b): weighted count}."""
+    pairs = Counter()
+    # TODO: for each piece and its frequency, add freq to every adjacent pair (a, b)
+    # --- SOLUTION START ---
+    for symbols, freq in corpus.items():
+        for a, b in zip(symbols, symbols[1:]):
+            pairs[(a, b)] += freq
+    # --- SOLUTION END ---
+    return pairs
+
+def merge_pair(corpus, pair):
+    """Returns a new corpus in which every occurrence of the adjacent pair is one symbol."""
+    a, b = pair
+    ab = a + b
+    new = Counter()
+    # TODO: rebuild each piece, replacing adjacent (a, b) by ab, left to right
+    # --- SOLUTION START ---
+    for symbols, freq in corpus.items():
+        out, i = [], 0
+        while i < len(symbols):
+            if i + 1 < len(symbols) and symbols[i] == a and symbols[i + 1] == b:
+                out.append(ab); i += 2
+            else:
+                out.append(symbols[i]); i += 1
+        new[tuple(out)] += freq
+    # --- SOLUTION END ---
+    return new
+
+def train_bpe(text, n_merges, verbose_every=100):
+    """Returns the ordered list of merges [(a, b), ...]; the order IS the tokenizer."""
+    corpus = Counter(to_bytes_tuple(p) for p in pre_tokenize(text))
+    merges = []
+    t0 = time.time()
+    for i in range(n_merges):
+        pairs = count_pairs(corpus)
+        if not pairs:
+            break
+        # TODO: pick the most frequent pair, record it, apply it to the corpus
+        # --- SOLUTION START ---
+        pair = max(pairs, key=pairs.get)       # ties: first in iteration order
+        merges.append(pair)
+        corpus = merge_pair(corpus, pair)
+        # --- SOLUTION END ---
+        if verbose_every and (i + 1) % verbose_every == 0:
+            a, b = pair
+            print(f"merge {i+1:4d}: {a!r} + {b!r} -> {(a+b)!r}  (count {pairs[pair]})  "
+                  f"{time.time()-t0:.0f}s")
+    return merges
+```
+
+```{python}
+#| label: bpe-train-test
+# test (toy corpus from the notes): the five merges must be ai, aix, baix, baixo, caix
+toy = " ".join(["baixo"] * 5 + ["baixa"] * 3 + ["abaixo"] * 2 + ["caixa"] * 4)
+m = train_bpe(toy, 5, verbose_every=0)
+got = [a + b for a, b in m]
+assert got == [b"ai", b"aix", b"baix", b"baixo", b"caix"] or got[:3] == [b"ai", b"aix", b"baix"], got
+print("ok:", got)
+```
+
+A detail you may notice: with the regex, `" baixo"` (with the leading space) and
+`"baixo"` (first word, no space) are *different pieces*, so the counts differ slightly
+from the notes, where the words were counted without spaces. The first three merges come
+out the same; the fourth and fifth may differ (`" baixo"` becomes a candidate). This is
+the pre-tokenization changing the tokenizer --- Section 4.3.3 of the notes.
+
+Now the real thing. 500 merges on 1.3 MB takes about a minute with this naive
+implementation (it recounts every pair at every step --- production tokenizers keep
+incremental indices).
+
+```{python}
+#| label: bpe-train-run
+N_MERGES = 500
+merges = train_bpe(train_text, N_MERGES, verbose_every=100)
+print(f"\nvocabulary size: {256 + len(merges)}")
+print("first 30 merges:", [ (a + b).decode("utf-8", errors="replace") for a, b in merges[:30] ])
+```
+
+**Question 1.** Look at the first 30 merges and at merges 200–230. Which ones are
+morphemes or words of Portuguese? Which ones are "accidents" of the corpus (names,
+punctuation patterns, the leading space)? Give three examples of each.
+
+### 1.3 Encoding and decoding
+
+Encoding applies the merges **in the order they were learned** to each pre-tokenized
+piece. Decoding concatenates the bytes of each token and decodes UTF-8.
+
+The vocabulary maps each token (`bytes`) to an integer id: ids `0..255` are the single
+bytes, in order; id `256 + i` is the result of merge `i`.
+
+```{python}
+#| label: bpe-encode
+class BPETokenizer:
+    def __init__(self, merges):
+        self.merges = list(merges)
+        self.vocab = [bytes([i]) for i in range(256)] + [a + b for a, b in self.merges]
+        self.id_of = {tok: i for i, tok in enumerate(self.vocab)}
+        self.rank = {pair: i for i, pair in enumerate(self.merges)}   # merge priority
+        self.cache = {}
+
+    def _encode_piece(self, piece):
+        """Applies merges to one pre-tokenized piece; returns a list of token ids."""
+        if piece in self.cache:
+            return self.cache[piece]
+        symbols = list(to_bytes_tuple(piece))
+        # TODO: while some adjacent pair of `symbols` is in self.rank, merge the pair
+        #       with the LOWEST rank (= learned earliest). Then map symbols to ids.
+        # --- SOLUTION START ---
+        while len(symbols) > 1:
+            # candidate merges present in this piece: (rank, position)
+            candidates = [(self.rank[(a, b)], i)
+                          for i, (a, b) in enumerate(zip(symbols, symbols[1:]))
+                          if (a, b) in self.rank]
+            if not candidates:
+                break
+            _, i = min(candidates)                      # earliest-learned merge wins
+            symbols = symbols[:i] + [symbols[i] + symbols[i + 1]] + symbols[i + 2:]
+        ids = [self.id_of[s] for s in symbols]
+        # --- SOLUTION END ---
+        self.cache[piece] = ids
+        return ids
+
+    def encode(self, text):
+        ids = []
+        for piece in pre_tokenize(text):
+            ids.extend(self._encode_piece(piece))
+        return ids
+
+    def decode(self, ids):
+        return b"".join(self.vocab[i] for i in ids).decode("utf-8", errors="replace")
+
+    def __len__(self):
+        return len(self.vocab)
+```
+
+A subtlety worth a minute: the solution above merges, at each step, the pair with the
+*lowest rank* among the pairs present. That is exactly "apply the merges in the learned
+order", but it is cheaper than scanning the whole merge list for every piece. Convince
+yourself the two are equivalent.
+
+```{python}
+#| label: bpe-encode-test
+# test: round trip, byte fallback, and the toy word from the notes
+tok = BPETokenizer(merges)
+for s in ["Capitu olhou-me com os olhos de ressaca.", "ação, coração — ñ 日本 🙂", "1899"]:
+    assert tok.decode(tok.encode(s)) == s, s
+print("round trip ok")
+ids = tok.encode(" Capitu")
+print(ids, [tok.vocab[i] for i in ids])
+print("tokens for ' desenvolvimento':", [tok.vocab[i] for i in tok.encode(" desenvolvimento")])
+```
+
+**Question 2.** Encode the string `"🙂"`. How many tokens does it take, and why? What
+would happen with a *character*-level tokenizer trained on this corpus?
+
+### 1.4 Fertility
+
+*Notes, Section 4.6.* Fertility = tokens per word. We compare your tokenizer with GPT-2's
+(via `tiktoken`) on a Portuguese and on an English sample. For the English sample we use
+the opening of *Pride and Prejudice*; you can swap in any English text.
+
+```{python}
+#| label: fertility
+# pip install tiktoken   (Colab: !pip install -q tiktoken)
+import tiktoken
+gpt2 = tiktoken.get_encoding("gpt2")
+
+EN_SAMPLE = """It is a truth universally acknowledged, that a single man in possession of a good
+fortune, must be in want of a wife. However little known the feelings or views of such a man
+may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the
+surrounding families, that he is considered the rightful property of some one or other of
+their daughters."""
+PT_SAMPLE = test_text[:2000]
+
+def fertility(text, encode):
+    """tokens per word; a word is a maximal run of letters/digits"""
+    words = regex.findall(r"\p{L}+|\p{N}+", text)
+    return len(encode(text)) / len(words)
+
+rows = []
+for name, enc in [("ours (V=%d)" % len(tok), tok.encode), ("GPT-2 (V=50257)", gpt2.encode)]:
+    rows.append((name, fertility(PT_SAMPLE, enc), fertility(EN_SAMPLE, enc)))
+print(f"{'tokenizer':20s} {'PT':>6s} {'EN':>6s}")
+for name, fpt, fen in rows:
+    print(f"{name:20s} {fpt:6.2f} {fen:6.2f}")
+```
+
+**Question 3.** Explain the four numbers. Why is *our* tokenizer's fertility on English
+not catastrophic, given that it never saw English? Why is GPT-2's fertility on Portuguese
+what it is, given that its vocabulary is 66 times larger than ours?
+
+### 1.5 Vocabulary size (optional, +5 min)
+
+Train tokenizers with 100, 500 and 1500 merges and plot fertility on the validation text
+against vocabulary size. Keep the three tokenizers; Section 2.5 uses them.
+
+```{python}
+#| label: vocab-sizes
+#| eval: false
+tokenizers = {}
+for k in [100, 500, 1500]:
+    tokenizers[k] = BPETokenizer(train_bpe(train_text, k, verbose_every=0))
+    print(k, "merges ->", round(fertility(val_text[:5000], tokenizers[k].encode), 3), "tokens/word")
+```
+
+---
+
+## 2. An interpolated $n$-gram language model
+
+*Notes, Section 3 and Appendix B.1.* The model is a table of counts per order, combined by
+linear interpolation. The tokens are the ids produced by your BPE tokenizer.
+
+### 2.1 Tokenize the splits
+
+```{python}
+#| label: tokenize-splits
+BOS, EOS = -1, -2     # ids outside the vocabulary; never produced by the tokenizer
+
+def to_ids(text, tok):
+    """One sequence per paragraph (so that EOS is predicted at paragraph ends)."""
+    return [tok.encode(p) for p in text.split("\n\n") if p.strip()]
+
+train_seqs = to_ids(train_text, tok)
+val_seqs   = to_ids(val_text, tok)
+test_seqs  = to_ids(test_text, tok)
+print("train tokens:", sum(map(len, train_seqs)), " val:", sum(map(len, val_seqs)),
+      " test:", sum(map(len, test_seqs)))
+print("bytes per token (train):", round(len(train_text.encode()) / sum(map(len, train_seqs)), 2))
+```
+
+### 2.2 Counting
+
+One addition to the notes' Appendix B.1: the **unigram** order gets additive smoothing
+over the whole vocabulary, $\hat p_1(w) = (c(w)+\alpha)/(N+\alpha V)$. Without it, a token
+that never occurred in training --- a rare byte, a rare merge --- gets probability zero
+at *every* order, and the interpolation cannot rescue it: the test perplexity is
+infinite because of a handful of positions. (Try it: set `alpha=0` below and evaluate.)
+The notes' toy example has no unseen tokens, so it used $\alpha = 0$.
+
+```{python}
+#| label: ngram-class
+class InterpolatedNGram:
+    """n-gram LM with Jelinek–Mercer interpolation over orders 1..n.
+
+    vocab_size: number of symbols the unigram can emit (tokenizer vocabulary + EOS);
+    alpha:      additive smoothing of the unigram, the floor that avoids zeros.
+    """
+
+    def __init__(self, n, vocab_size, alpha=1.0):
+        self.n, self.V, self.alpha = n, vocab_size, alpha
+        self.lambdas = tuple([1.0 / n] * n)          # uniform until tuned
+        # counts[k][h] : Counter of the symbols that follow history h of length k
+        self.counts = [defaultdict(Counter) for _ in range(n)]
+        self.totals = [dict() for _ in range(n)]     # totals[k][h] = sum of counts[k][h]
+        self.vocab = set()
+
+    def train(self, sequences):
+        for seq in sequences:
+            toks = [BOS] * (self.n - 1) + list(seq) + [EOS]
+            self.vocab.update(toks)
+            for t in range(self.n - 1, len(toks)):
+                # TODO: for each order k = 0..n-1, increment counts[k][history][toks[t]]
+                #       where history = tuple(toks[t-k:t])  (empty tuple for k = 0)
+                # --- SOLUTION START ---
+                for k in range(self.n):
+                    h = tuple(toks[t - k:t])
+                    self.counts[k][h][toks[t]] += 1
+                # --- SOLUTION END ---
+        for k in range(self.n):
+            self.totals[k] = {h: sum(c.values()) for h, c in self.counts[k].items()}
+        return self
+
+    def prob(self, w, history):
+        """p_int(w | history) = sum_k lambda_{k+1} * p_MLE^{(k+1)}(w | last k tokens)."""
+        p = 0.0
+        # TODO: implement the interpolation. Order k = 0 (unigram) uses additive
+        #       smoothing with self.alpha over self.V symbols; an unseen history at
+        #       order k > 0 contributes 0 at that order.
+        # --- SOLUTION START ---
+        for k in range(self.n):
+            h = tuple(history[len(history) - k:]) if k > 0 else ()
+            tot = self.totals[k].get(h, 0)
+            if k == 0:
+                p_k = (self.counts[0][h][w] + self.alpha) / (tot + self.alpha * self.V)
+            else:
+                p_k = self.counts[k][h][w] / tot if tot else 0.0
+            p += self.lambdas[k] * p_k
+        # --- SOLUTION END ---
+        return p
+
+    def log_probs(self, sequences):
+        """List of log p(x_t | x_<t) in nats, over all positions, EOS included."""
+        out = []
+        for seq in sequences:
+            toks = [BOS] * (self.n - 1) + list(seq) + [EOS]
+            for t in range(self.n - 1, len(toks)):
+                p = self.prob(toks[t], toks[max(0, t - self.n + 1):t])
+                out.append(math.log(p) if p > 0 else float("-inf"))
+        return out
+```
+
+```{python}
+#| label: ngram-test
+# test: on the toy corpus of the notes the interpolated bigram gives PPL 4.49 on the
+# five internal bigrams (the unigram here counts BOS/EOS, see notes, Appendix B.1)
+toy_train = "o gato dormiu no sofá . o cachorro dormiu no tapete . o gato comeu no tapete .".split()
+toy_test  = "o cachorro comeu no sofá .".split()
+m2 = InterpolatedNGram(2, vocab_size=10, alpha=0.0).train([toy_train]); m2.lambdas = (0.3, 0.7)
+lp = [math.log(m2.prob(w, toy_test[:i])) for i, w in enumerate(toy_test) if i > 0]
+assert abs(math.exp(-sum(lp) / 5) - 4.49) < 0.01, math.exp(-sum(lp) / 5)
+print("ok: PPL on the toy sentence =", round(math.exp(-sum(lp) / 5), 2))
+```
+
+### 2.3 Evaluation: cross-entropy, perplexity, bits per byte
+
+*Notes, Section 2.4.* Three numbers from the same list of log-probabilities. Bits per
+byte divides the **total** bits by the number of **bytes of the test text** --- the
+quantity that does not depend on the tokenizer.
+
+```{python}
+#| label: evaluate
+def evaluate(model, sequences, n_bytes):
+    """Returns dict with cross-entropy (nats/token), perplexity, bits/byte, n_tokens."""
+    lp = model.log_probs(sequences)
+    # TODO: compute the three quantities from lp and n_bytes
+    # --- SOLUTION START ---
+    total_nats = -sum(lp)
+    ce = total_nats / len(lp)
+    ppl = math.exp(ce)
+    bpb = total_nats / math.log(2) / n_bytes
+    # --- SOLUTION END ---
+    return {"ce_nats": ce, "ppl": ppl, "bpb": bpb, "n_tokens": len(lp)}
+
+test_bytes = len(test_text.encode("utf-8"))
+val_bytes  = len(val_text.encode("utf-8"))
+
+V_OUT = len(tok) + 1          # the tokenizer's vocabulary plus EOS
+model3 = InterpolatedNGram(3, V_OUT).train(train_seqs)
+print("uniform lambdas:", evaluate(model3, test_seqs, test_bytes))
+```
+
+**The zero.** Set the weights to `(0, 0, 1)` --- pure trigram MLE --- and evaluate.
+
+```{python}
+#| label: zero
+model3.lambdas = (0.0, 0.0, 1.0)
+r = evaluate(model3, test_seqs, test_bytes)
+print(r)
+lp = model3.log_probs(test_seqs)
+print("positions with p = 0:", sum(1 for x in lp if x == float("-inf")), "of", len(lp))
+```
+
+**Question 4.** How many test positions get probability zero under the unsmoothed
+trigram? Pick one of them, print the context, and explain *why* the trigram has no count
+for it. Then do the same with `(0, 1, 0)` (pure bigram), and with the uniform weights but
+`alpha=0`. How many zeros remain in the last case, and what are they?
+
+### 2.4 Tuning the interpolation weights
+
+A grid over the simplex $\{\lambda_1 + \lambda_2 + \lambda_3 = 1\}$ in steps of $0.1$
+(66 points), choosing the one that minimizes cross-entropy on the **validation** set.
+About a minute.
+
+```{python}
+#| label: tune
+def tune_lambdas(model, val_seqs, step=0.1):
+    best = (float("inf"), None)
+    steps = int(round(1 / step))
+    # TODO: for every (l1, l2, l3) on the grid with l1 + l2 + l3 = 1, set model.lambdas,
+    #       evaluate cross-entropy on val_seqs, keep the best. Return (best_ce, best_lambdas).
+    # --- SOLUTION START ---
+    for i in range(steps + 1):
+        for j in range(steps + 1 - i):
+            lam = (i * step, j * step, 1 - i * step - j * step)
+            model.lambdas = lam
+            lp = model.log_probs(val_seqs)
+            if any(x == float("-inf") for x in lp):
+                continue
+            ce = -sum(lp) / len(lp)
+            if ce < best[0]:
+                best = (ce, lam)
+    # --- SOLUTION END ---
+    model.lambdas = best[1]
+    return best
+
+t0 = time.time()
+best_ce, best_lam = tune_lambdas(model3, val_seqs)
+print(f"best lambdas {best_lam}, val CE {best_ce:.4f} nats/token  ({time.time()-t0:.0f}s)")
+result_bpe = evaluate(model3, test_seqs, test_bytes)
+print("TEST:", result_bpe)
+```
+
+**Question 5.** Which order gets the largest weight? Would you expect that to change with
+(a) ten times more training data, (b) a tokenizer with 10 000 merges? Why?
+
+### 2.5 The same model, other tokenizations
+
+*Notes, Pitfall 1.* Train the *same* trigram on three tokenizations of the *same* text ---
+raw bytes, BPE with 100 merges, BPE with 500 merges --- and compare. Perplexity per token
+will go one way; bits per byte may go another.
+
+```{python}
+#| label: compare-tokenizations
+class ByteTokenizer:
+    def encode(self, text): return list(text.encode("utf-8"))
+    def decode(self, ids):  return bytes(ids).decode("utf-8", errors="replace")
+    def __len__(self):      return 256
+
+candidates = {"bytes (V=256)": ByteTokenizer(), f"BPE-{N_MERGES} (V={len(tok)})": tok}
+if "tokenizers" in globals():                       # from Section 1.5, if you ran it
+    for k, tk in tokenizers.items():
+        candidates[f"BPE-{k} (V={len(tk)})"] = tk
+
+print(f"{'tokenizer':22s} {'tok/byte':>9s} {'lambdas':>18s} {'PPL/token':>10s} {'bits/byte':>10s}")
+results = {}
+for name, tk in candidates.items():
+    tr, va, te = to_ids(train_text, tk), to_ids(val_text, tk), to_ids(test_text, tk)
+    m = InterpolatedNGram(3, len(tk) + 1).train(tr)
+    tune_lambdas(m, va)
+    r = evaluate(m, te, test_bytes)
+    results[name] = r
+    print(f"{name:22s} {r['n_tokens']/test_bytes:9.3f} {str(tuple(round(l,1) for l in m.lambdas)):>18s} "
+          f"{r['ppl']:10.2f} {r['bpb']:10.3f}")
+```
+
+**Question 6.** Rank the tokenizations by perplexity per token and by bits per byte. Are the
+rankings the same? Which one tells you which model predicts Portuguese best, and why?
+(This is the whole point of Pitfall 1.)
+
+### 2.6 Sampling
+
+*Notes, Section 1.3.* Ancestral sampling from the tuned trigram, decoded with your
+tokenizer. It will not be good prose; it should be recognizably Machado-flavoured
+Portuguese with sentence-level structure and no long-range coherence --- which is
+exactly what the fixed window predicts.
+
+```{python}
+#| label: sample
+def sample(model, tok, max_tokens=120, temperature=1.0):
+    history = [BOS] * (model.n - 1)
+    out = []
+    cands = [w for w in model.vocab if w != BOS]
+    for _ in range(max_tokens):
+        h = tuple(history[len(history) - model.n + 1:])
+        probs = [model.prob(w, h) ** (1 / temperature) for w in cands]
+        z = sum(probs)
+        w = random.choices(cands, weights=[p / z for p in probs])[0]
+        if w == EOS:
+            break
+        out.append(w); history.append(w)
+    return tok.decode(out)
+
+for _ in range(3):
+    print(sample(model3, tok), "\n")
+```
+
+---
+
+## 3. Report
+
+Fill in the table and save the artifacts that Lab 3 will use: the test set (already in
+`data/lab1_test.txt`), your tokenizer, and the baseline numbers. **Lab 3's GPT will be
+evaluated on the same test set, with the same tokenizer, in the same units.**
+
+```{python}
+#| label: save
+artifacts = {
+    "n_merges": N_MERGES,
+    "merges": [[a.hex(), b.hex()] for a, b in merges],      # bytes as hex strings
+    "lambdas": model3.lambdas,
+    "test_bytes": test_bytes,
+    "baseline": result_bpe,
+    "all_tokenizations": results,
+}
+(DATA / "lab1_artifacts.json").write_text(json.dumps(artifacts, indent=1))
+print(json.dumps({k: v for k, v in artifacts.items() if k != "merges"}, indent=1))
+```
+
+| Model | Tokenizer | $V$ | tokens/byte | CE (nats/token) | PPL | bits/byte |
+|---|---|---|---|---|---|---|
+| trigram, interpolated | bytes | 256 | | | | |
+| trigram, interpolated | BPE-500 | 756 | | | | |
+| *(Lab 3)* GPT ~10M | BPE-500 | 756 | | | | |
+
+**Question 7 (closing).** In one paragraph: what would a model need in order to beat the
+best bits-per-byte in your table by a wide margin --- more data, a larger $n$, a larger
+vocabulary, or something structurally different? Use the two defects of Section 3.5 of
+the notes.
+
+---
+
+## Written exercises
+
+Exercises 1–6 of the lecture notes (Section "Exercises") are due with this notebook.
+Exercise 3 (BPE by hand) can be checked against Section 1.2 above; Exercise 5 (gzip as a
+language model) fits naturally as an extra cell at the end of Section 2.5 --- if you do it
+there, add `zlib` to the comparison table.

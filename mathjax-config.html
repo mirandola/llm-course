@@ -1,0 +1,37 @@
+<!-- MathJax: SVG output (no web fonts needed) and punctuation glued to inline formulas.
+     Used by the lecture notes via `include-in-header`. -->
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]], processEscapes: true },
+    svg: { fontCache: "global" },
+    options: { skipHtmlTags: ["script", "noscript", "style", "textarea", "pre", "code"] },
+    startup: {
+      pageReady: function () {
+        return MathJax.startup.defaultPageReady().then(function () {
+          // keep ",", ".", ")" etc. on the same line as the formula they follow,
+          // and "(" on the same line as the formula it precedes
+          var trail = /^[,.;:!?)\]]+/, lead = /[(\[]$/;
+          document.querySelectorAll('mjx-container:not([display="true"])').forEach(function (c) {
+            var span = document.createElement("span");
+            span.style.whiteSpace = "nowrap";
+            var prev = c.previousSibling, next = c.nextSibling, m;
+            c.parentNode.insertBefore(span, c);
+            if (prev && prev.nodeType === 3 && (m = prev.nodeValue.match(lead))) {
+              prev.nodeValue = prev.nodeValue.slice(0, -m[0].length);
+              span.appendChild(document.createTextNode(m[0]));
+            }
+            span.appendChild(c);
+            if (next && next.nodeType === 3 && (m = next.nodeValue.match(trail))) {
+              next.nodeValue = next.nodeValue.slice(m[0].length);
+              span.appendChild(document.createTextNode(m[0]));
+            }
+          });
+        });
+      }
+    }
+  };
+</script>
+<style>
+  mjx-container[jax="SVG"] { font-size: 1.02em; }
+  mjx-container[jax="SVG"][display="true"] { margin: 1.1em 0; max-width: 100%; overflow-x: auto; overflow-y: hidden; }
+</style>

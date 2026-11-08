@@ -1,0 +1,61 @@
+---
+title: "Large Language Models"
+subtitle: "A 60-hour course — Instituto de Matemática, UFRJ"
+toc: false
+---
+
+Architecture, training, post-training and inference of Transformer language models from
+first principles — from the tokenizer to reinforcement learning with verifiable rewards —
+and how to choose, adapt, evaluate and serve models of different scales without treating
+them as black boxes behind an API.
+
+**Instructor:** Heudson Mirandola · **Load:** 15 weeks × (2 h lecture + 2 h lab)
+
+**Prerequisites.** Linear algebra, probability, neural networks (backpropagation, SGD
+training) and PyTorch at the level of `autograd` and `nn.Module`. Desirable: Optimization
+and Reinforcement Learning (the latter for the alignment module).
+
+**Tools.** PyTorch; Hugging Face `transformers`, `datasets`, `peft`, `trl`,
+`sentence-transformers`; vLLM for serving; `nanoGPT` and `nanochat` as code references.
+Labs run on Colab; nothing in the course needs more than one GPU of 16–24 GB.
+
+## How the course is organized
+
+Labs 1–5 are incremental and produce, by the end of week 5, a GPT trained from scratch
+with a scaling experiment. Labs 6–13 are independent of each other and feed the final
+project.
+
+| Week | Module | Lecture | Lab |
+|:--:|:--:|:---|:---|
+| 1 | 1 | [Language modeling, perplexity, compression; $n$-grams; BPE and its consequences](notes/M1P1.qmd) | [Lab 1 — byte-level BPE and an $n$-gram baseline](labs/lab1.qmd) |
+| 2 | 2 | Embeddings; scaled dot-product attention, causal mask, multi-head; $O(n^2)$ cost; the Transformer block | Lab 2 — attention and Transformer block in plain PyTorch; test against `nn.MultiheadAttention`; memory profile vs. length |
+| 3 | 2 | The Llama recipe: pre-norm, RMSNorm, SwiGLU, RoPE, GQA. The three families. MoE, linear attention and SSMs (overview) | Lab 3 — GPT of ~10M parameters on a small corpus; sampling; absolute positions vs. RoPE |
+| 4 | 3 | AdamW, schedules, clipping, bf16, accumulation; diagnosing instabilities; FLOPs and memory; FlashAttention | Lab 4 — 50–125M model on a FineWeb-Edu subset; throughput, memory, utilization; reproduce and fix a loss spike |
+| 5 | 3 | Scaling laws; budget allocation; data-constrained regime; curation and deduplication; parallelism (1 h, lecture only) | Lab 5 — mini scaling experiment (3 sizes × 2 token budgets); power-law fit. Consolidated delivery of labs 1–5 |
+| 6 | 4 | Modern encoders; contrastive learning and embeddings; GLiNER; SLMs; distillation and synthetic data | Lab 6 — fine-tune an encoder for classification vs. LLM prompting; cost × accuracy × latency |
+| 7 | 5 | SFT and instruction tuning; chat templates; LoRA/QLoRA; forgetting | Lab 7 — LoRA on a 0.5–2B model with `peft`/`trl`; compare ranks; measure forgetting. *Final project defined* |
+| 8 | 6 | Bradley–Terry; reward models; RLHF with PPO; KL-regularized objective, closed form and the DPO derivation | Lab 8 — DPO on the SFT model of Lab 7; inspect the implicit reward margin |
+| 9 | 6 | RLVR and GRPO; DeepSeek-R1; test-time compute; alignment pathologies | Lab 9 — GRPO with a verifier on a GSM8K subset, or best-of-$n$ with a verifier |
+| 10 | 7 | Decoding; KV cache arithmetic; quantization; speculative decoding; continuous batching, PagedAttention, prefix caching | Lab 10 — serve with vLLM; latency/throughput vs. batch and context; quantize and measure degradation |
+| 11 | 8 | Context as a budget: anatomy and hierarchy; position effects and length degradation (RULER, NoLiMa); ICL and calibration; CoT; RAG; structured output | Lab 11 — RAG pipeline with quantitative evaluation; ablations of reranker, chunk size, number and position of passages |
+| 12 | 8–9 | Agents as context management (1 h). Evaluation: benchmarks, contamination, error bars, "emergent abilities", LLM-as-a-judge (1 h) | Lab 12 — evaluate two models with confidence intervals; judge–human agreement |
+| 13 | 9 | Hallucination; memorization and extraction; direct and indirect prompt injection; bias; calibration | Lab 13 — injection attacks against the Lab 11 pipeline and mitigations; calibration |
+| 14 | 10 | Floating topic chosen with the class | Project office hours |
+| 15 | 10 | Project presentations | Project presentations |
+
+## Assessment
+
+- **GPT from scratch (labs 1–5): 30 %.** Single delivery in week 5: code, short report, scaling experiment. In pairs.
+- **Labs 6–13: 30 %.** Eight short reports; the best six count.
+- **Final project: 40 %.** Defined in week 7, in one of four tracks: (a) post-training a decoder (SFT → DPO or GRPO) with evaluation; (b) encoder/SLM for extraction or classification, compared with LLM prompting; (c) RAG pipeline or agent with quantitative evaluation and adversarial testing; (d) an empirical study (scaling, quantization, decoding) with statistical rigor. Code, report of up to 8 pages, 15-minute presentation.
+
+## Core bibliography
+
+- Jurafsky, D.; Martin, J. H. *Speech and Language Processing*, 3rd ed. (open draft). <https://web.stanford.edu/~jurafsky/slp3/>
+- Raschka, S. *Build a Large Language Model (From Scratch)*. Manning, 2024.
+- Raschka, S. *Build a Reasoning Model (From Scratch)*. Manning, 2026.
+- Prince, S. J. D. *Understanding Deep Learning*. MIT Press, 2023. <https://udlbook.github.io/udlbook/>
+
+Course material used as reference: Stanford CS336 (*Language Modeling from Scratch*),
+Karpathy's *Zero to Hero*, `nanoGPT` and `nanochat`, Stanford CS224N, and the Hugging
+Face *LLM Course*. The per-module bibliography is at the end of each set of lecture notes.

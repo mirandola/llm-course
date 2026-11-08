@@ -1,0 +1,63 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - "*.qmd"
+    - "!README.md"
+
+website:
+  title: "Large Language Models"
+  description: "Lecture notes, slides and labs for the 60-hour course at UFRJ."
+  site-url: https://mirandola.github.io/llm-course
+  repo-url: https://github.com/mirandola/llm-course
+  repo-actions: [issue]
+  page-navigation: true
+  navbar:
+    left:
+      - href: index.qmd
+        text: Course
+      - href: notes/index.qmd
+        text: Notes
+      - href: labs/index.qmd
+        text: Labs
+      - href: slides/index.qmd
+        text: Slides
+    right:
+      - icon: github
+        href: https://github.com/mirandola/llm-course
+  sidebar:
+    - id: notes
+      title: "Lecture notes"
+      style: docked
+      collapse-level: 1
+      contents:
+        - section: "Module 1 — Language modeling and tokenization"
+          contents:
+            - notes/M1P1.qmd
+    - id: labs
+      title: "Labs"
+      style: docked
+      contents:
+        - labs/index.qmd
+        - labs/lab1.qmd
+  page-footer:
+    left: "Heudson Mirandola · Instituto de Matemática, UFRJ"
+    right: "Built with Quarto"
+
+format:
+  html:
+    theme: [default, lecture-notes.scss]
+    toc: true
+    toc-depth: 2
+    toc-location: right
+    number-sections: false
+    html-math-method: mathjax
+    include-in-header: mathjax-config.html
+    code-copy: true
+    code-overflow: wrap
+    smooth-scroll: true
+    link-external-newwindow: true
+    lang: en
+
+execute:
+  freeze: auto

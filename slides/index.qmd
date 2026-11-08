@@ -1,0 +1,10 @@
+---
+title: "Slides"
+toc: false
+---
+
+Beamer decks, one per lecture. The LaTeX sources are in the repository under `slides/`.
+
+| Week | Lecture | PDF |
+|:--:|:---|:---|
+| 1 | Language modeling, perplexity and tokenization | [M1P1_lecture_slides.pdf](M1P1_lecture_slides.pdf) |

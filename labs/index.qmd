@@ -1,0 +1,15 @@
+---
+title: "Labs"
+toc: false
+---
+
+Each lab is a Quarto document that is also distributed as a Jupyter notebook. Open the
+**student** notebook in Colab, fill in the `TODO` cells, and submit the executed notebook.
+The **solutions** notebook is published after the deadline.
+
+| Week | Lab | Page | Student notebook | Solutions |
+|:--:|:---|:---|:---|:---|
+| 1 | Byte-level BPE and an $n$-gram baseline | [lab 1](lab1.qmd) | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mirandola/llm-course/blob/main/labs/M1P2_lab1_student.ipynb) | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mirandola/llm-course/blob/main/labs/M1P2_lab1_solutions.ipynb) |
+
+The notebooks are generated from the `.qmd` source with `tools/make_lab_versions.py`;
+solution regions are marked in the source and replaced by stubs in the student version.

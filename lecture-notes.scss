@@ -1,0 +1,165 @@
+/*-- scss:defaults --*/
+// Theme for the course's lecture notes (Quarto HTML).
+// Usage in the YAML header:   theme: [default, lecture-notes.scss]
+
+@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Source+Sans+3:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+$font-family-sans-serif: "Source Sans 3", "Helvetica Neue", Arial, sans-serif;
+$font-family-monospace:  "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+$font-family-base:       "Source Serif 4", Georgia, "Times New Roman", serif;
+
+$font-size-base:   1.0625rem;   // 17px
+$line-height-base: 1.62;
+
+$ink:        #1b1f24;
+$ink-soft:   #4b5563;
+$accent:     #1d4e89;
+$accent-bg:  #eef3fa;
+$rule:       #e2e5ea;
+$code-bg:    #f6f7f9;
+
+$body-color:       $ink;
+$body-bg:          #ffffff;
+$link-color:       $accent;
+$link-decoration:  none;
+$headings-font-family: $font-family-sans-serif;
+$headings-font-weight: 600;
+$headings-color:   $ink;
+
+$code-color:       #0b3d6b;
+$code-bg:          $code-bg;
+$code-block-bg:    $code-bg;
+$code-block-border-left: $accent;
+
+$toc-font-size:    0.86rem;
+$toc-color:        $ink-soft;
+$toc-active-border: $accent;
+
+$content-width:    44rem;        // measure of the main column
+
+/*-- scss:rules --*/
+
+// ---------- page frame ----------
+body { -webkit-font-smoothing: antialiased; }
+
+#quarto-content > .page-columns { column-gap: 3rem; }
+
+#title-block-header {
+  margin-bottom: 2.5rem;
+  padding-bottom: 1.25rem;
+  border-bottom: 2px solid $ink;
+  .title    { font-family: $font-family-sans-serif; font-weight: 700; font-size: 2.1rem; letter-spacing: -0.01em; line-height: 1.15; }
+  .subtitle { font-family: $font-family-sans-serif; font-size: 1.05rem; color: $ink-soft; margin-top: 0.5rem; }
+  .quarto-title-meta { font-family: $font-family-sans-serif; font-size: 0.9rem; color: $ink-soft; margin-top: 1rem; }
+}
+
+// ---------- headings ----------
+h1, .h1 { font-size: 1.65rem; margin-top: 3rem; padding-bottom: 0.35rem; border-bottom: 1px solid $rule; }
+h2, .h2 { font-size: 1.28rem; margin-top: 2.2rem; border-bottom: none; padding-bottom: 0; }
+h3, .h3 { font-size: 1.05rem; margin-top: 1.6rem; color: $ink-soft; text-transform: uppercase; letter-spacing: 0.06em; }
+.header-section-number { color: $accent; font-weight: 600; margin-right: 0.4em; }
+
+// ---------- text ----------
+p { margin-bottom: 1.05rem; hyphens: auto; }
+strong { font-weight: 600; }
+ol, ul { padding-left: 1.4rem; }
+li { margin-bottom: 0.35rem; }
+li > p { margin-bottom: 0.5rem; }
+hr { border-top: 1px solid $rule; margin: 2.5rem auto; width: 30%; }
+
+// quotes are used for "hooks" to other modules and for the opening claim
+blockquote {
+  margin: 1.4rem 0;
+  padding: 0.75rem 1.1rem;
+  border-left: 3px solid $accent;
+  background: $accent-bg;
+  color: $ink;
+  font-size: 0.97em;
+  p:last-child { margin-bottom: 0; }
+}
+
+// ---------- math ----------
+.math.display { margin: 1.1rem 0; overflow-x: auto; overflow-y: hidden; }
+
+// ---------- propositions and proofs (divs tagged in the source) ----------
+.statement {
+  margin: 1.4rem 0 1rem;
+  padding: 0.8rem 1.1rem;
+  border: 1px solid $rule;
+  border-left: 3px solid $ink;
+  background: #fbfbfc;
+  p:last-child { margin-bottom: 0; }
+}
+.argument {
+  margin: 0.6rem 0 1.4rem;
+  padding-left: 1.1rem;
+  border-left: 1px solid $rule;
+  color: $ink;
+  p:last-child { margin-bottom: 0; }
+}
+
+// ---------- code ----------
+code { font-size: 0.86em; padding: 0.1em 0.3em; border-radius: 3px; }
+pre {
+  font-size: 0.8rem;
+  line-height: 1.5;
+  padding: 0.9rem 1.1rem;
+  border-radius: 4px;
+  border-left-width: 3px;
+}
+div.sourceCode { margin: 1.2rem 0; }
+pre code { padding: 0; font-size: inherit; }
+code span.co { color: #6b7280; font-style: italic; }   // comments
+code span.kw, code span.cf, code span.im { color: #1d4e89; font-weight: 600; }
+code span.st { color: #9a3412; }
+code span.dv, code span.fl { color: #0f766e; }
+
+// ---------- tables ----------
+table {
+  font-family: $font-family-sans-serif;
+  font-size: 0.9rem;
+  margin: 1.4rem auto;
+  border-collapse: collapse;
+  border-top: 2px solid $ink;
+  border-bottom: 2px solid $ink;
+}
+thead th {
+  font-weight: 600;
+  text-align: left;
+  padding: 0.45rem 0.9rem;
+  border-bottom: 1px solid $ink;
+  vertical-align: bottom;
+}
+tbody td { padding: 0.4rem 0.9rem; border-top: 1px solid $rule; vertical-align: top; }
+tbody tr:first-child td { border-top: none; }
+table code { font-size: 0.85em; background: transparent; padding: 0; }
+.center table { margin-left: auto; margin-right: auto; }
+
+// ---------- table of contents ----------
+#TOC, #quarto-sidebar, .sidebar nav[role=doc-toc] {
+  font-family: $font-family-sans-serif;
+  > ul { padding-left: 0; }
+  ul li a { padding: 0.18rem 0.6rem; line-height: 1.35; }
+  ul li a.active { color: $accent; font-weight: 600; }
+  h2#toc-title { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: $ink-soft; }
+}
+
+// ---------- references list ----------
+#references-for-this-lecture ~ ul li, section#references-for-this-lecture li { font-size: 0.95em; }
+
+// ---------- print ----------
+@media print {
+  body { font-size: 11pt; }
+  #quarto-sidebar, #TOC, .sidebar { display: none; }
+  pre { white-space: pre-wrap; }
+}
+
+// ---------- site chrome (website project) ----------
+.navbar, .navbar-brand, .sidebar, .page-footer, .quarto-title-banner { font-family: $font-family-sans-serif; }
+.navbar-brand { font-weight: 700; letter-spacing: -0.01em; }
+.sidebar-navigation .sidebar-item { font-size: 0.9rem; }
+// wide tables scroll inside their own frame on narrow screens
+@media (max-width: 767px) {
+  main table { display: block; width: 100%; overflow-x: auto; }
+  main table thead, main table tbody { display: table; width: max-content; min-width: 100%; }
+}

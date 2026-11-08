@@ -1,0 +1,1518 @@
+% Slides M1P1 -- Language modeling, perplexity and tokenization
+% Large Language Models (60h) -- Module 1, lecture -- Week 1
+%
+% Compile with: pdflatex M1P1_lecture_slides.tex (twice, for the table of contents)
+% Derived from the lecture notes M1P1_lecture_notes.tex; sections and examples match
+% one to one. One idea per frame; details and proofs are in the notes.
+% No overlays (\pause, \uncover): each frame is one page.
+
+\documentclass[11pt,aspectratio=169]{beamer}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+
+% --- Theme: deliberately neutral, to be replaced by the course's usual theme ---
+\usetheme{default}
+\usecolortheme{default}
+\useinnertheme{rectangles}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}{%
+  \hfill{\scriptsize\insertsection\quad\insertframenumber/\inserttotalframenumber}\hspace{0.5em}\vspace{0.3em}}
+\setbeamertemplate{section in toc}[sections numbered]
+\setbeamercolor{block title}{bg=structure!15,fg=structure}
+\setbeamercolor{block body}{bg=structure!5}
+\setbeamertemplate{blocks}[rounded][shadow=false]
+\setbeamerfont{frametitle}{series=\bfseries}
+\setbeamertemplate{itemize item}{\textbullet}
+\setbeamertemplate{itemize subitem}{--}
+\setlength{\leftmargini}{1.2em}
+\AtBeginSection[]{\begin{frame}{Outline}\tableofcontents[currentsection]\end{frame}}
+
+% --- Python code ---
+\lstdefinestyle{py}{
+  language=Python,
+  basicstyle=\ttfamily\footnotesize,
+  commentstyle=\color{gray!70!black}\itshape,
+  keywordstyle=\color{structure}\bfseries,
+  stringstyle=\color{red!60!black},
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{gray!50},
+  xleftmargin=0.5em,
+  inputencoding=utf8,
+  extendedchars=true,
+  literate={á}{{\'a}}1 {ã}{{\~a}}1 {â}{{\^a}}1 {é}{{\'e}}1 {ê}{{\^e}}1 {í}{{\'i}}1
+           {ó}{{\'o}}1 {õ}{{\~o}}1 {ô}{{\^o}}1 {ú}{{\'u}}1 {ç}{{\c{c}}}1,
+}
+
+% --- Shorthands ---
+\newcommand{\V}{\mathcal{V}}
+\newcommand{\Lc}{\mathcal{L}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\PPL}{\mathrm{PPL}}
+\newcommand{\pstar}{p^{\star}}
+\newcommand{\ptheta}{p_{\theta}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\dest}[1]{\textcolor{structure}{\textbf{#1}}}
+\newcommand{\hook}[1]{{\small\textcolor{gray!60!black}{\textit{#1}}}}
+\newcommand{\eos}{\texttt{<eos>}}
+\newcommand{\bos}{\texttt{<bos>}}
+\newcommand{\sep}{\textperiodcentered}
+
+\title{Language modeling, perplexity and tokenization}
+\subtitle{Large Language Models \,\textperiodcentered\, Module 1, lecture 1 (M1P1) \,\textperiodcentered\, Week 1}
+\author{Heudson Mirandola}
+\institute{Instituto de Matemática, UFRJ}
+\date{October 2026}
+
+\begin{document}
+
+\begin{frame}[plain]
+  \titlepage
+\end{frame}
+
+\begin{frame}{One idea organizes the lecture}
+  \begin{block}{}
+    \centering\Large
+    Modeling language, predicting the next symbol\\ and compressing text are the same problem.
+  \end{block}
+
+  \vspace{1.2em}
+  \begin{itemize}
+    \item \textbf{Section 2:} the loss we train with \emph{is} the number of bits a compressor
+          built on the model would spend.
+    \item \textbf{Section 3:} the first concrete model ($n$-grams) and the wall it hits.
+    \item \textbf{Section 4:} the tokenizer is itself a compressor --- and leaves visible
+          marks on production models.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Objectives}
+  By the end of the lecture you should be able to
+  \begin{enumerate}
+    \item write the likelihood of an autoregressive model and say why training is
+          minimizing cross-entropy;
+    \item compute and interpret perplexity --- and know when it is \emph{not} comparable;
+    \item explain, via arithmetic coding, why modeling language is compressing;
+    \item estimate a smoothed $n$-gram model and name its two structural limits;
+    \item run BPE by hand and predict side effects of tokenization.
+  \end{enumerate}
+
+  \vspace{1em}
+  \textbf{Prerequisites:} discrete probability; entropy, cross-entropy, KL; maximum likelihood.
+
+  \textbf{Conventions:} $\log$ is natural, $\log_2$ when the unit is the bit;
+  $x_{<t} = (x_1,\dots,x_{t-1})$, $x_{1:T} = (x_1,\dots,x_T)$.
+\end{frame}
+
+% =====================================================================
+\section{The problem}
+
+\begin{frame}{A language model is a distribution over sequences}
+  Fix a finite \dest{vocabulary} $\V$, $|\V| = V$. A text is a finite sequence
+  $x = (x_1,\dots,x_T)$, $x_t\in\V$. All such sequences: $\V^{*}$.
+
+  \vspace{0.8em}
+  \[
+    p : \V^{*}\to[0,1], \qquad \sum_{x\in\V^{*}} p(x) = 1 .
+  \]
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item Tokens are discrete: ``density'' in the syllabus means probability mass function.
+    \item What a symbol \emph{is} (letter, byte, word, subword) is a design decision ---
+          Section 4.
+    \item $\V^{*}$ is infinite: $p$ does not fit in a table. We need a computable form.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Autoregressive factorization}
+  Chain rule --- valid for \emph{any} joint distribution, no assumption:
+  \[
+    p(x_1,\dots,x_T) \;=\; \prod_{t=1}^{T} p(x_t\mid x_{<t}).
+  \]
+
+  \vspace{0.6em}
+  \begin{block}{}
+    Each factor is a \textbf{$V$-way classification} conditioned on the prefix.\\
+    An autoregressive LM is a classifier: prefix in, $V$ probabilities out.
+  \end{block}
+
+  \vspace{0.8em}
+  The whole course up to Module 6 is about how to parametrize and estimate
+  $\ptheta(x_t\mid x_{<t})$: count tables (Section 3) or a neural network (Week 2).
+\end{frame}
+
+\begin{frame}{Detail 1: the end of the sequence is a symbol}
+  $\V = \{a,b\}$. What is $p(a)$, the probability of the length-1 sequence?
+
+  \vspace{0.4em}
+  By the factorization, $p(a) = p(x_1 = a)$. But
+  \[
+    p(a,a) + p(a,b) = p(x_1=a)\big[p(x_2=a\mid a) + p(x_2=b\mid a)\big] = p(x_1 = a) = p(a).
+  \]
+  The mass of $(a)$ equals the mass of \emph{all} length-2 sequences starting with $a$.
+  Summing over lengths, the total diverges.
+
+  \vspace{0.6em}
+  \dest{$p$ is not a distribution over $\V^{*}$} --- it is one distribution per length.
+\end{frame}
+
+\begin{frame}{Detail 1: the fix}
+  Add a symbol \eos{} and define: the sequence \emph{ends} when \eos{} is emitted.
+  \[
+    p(a) = p(x_1 = a)\;p(x_2 = \eos \mid a) \;\neq\; p(x_1 = a).
+  \]
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item Now $p$ sums to 1 over $\V^{*}$ (under mild conditions on \eos).
+    \item Every practical model has this symbol.
+    \item Without it, the model ``does not know how to stop''.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Detail 2: generation is ancestral sampling}
+  \[
+    x_1\sim\ptheta(\cdot\mid\varnothing),\qquad
+    x_2\sim\ptheta(\cdot\mid x_1),\qquad
+    x_3\sim\ptheta(\cdot\mid x_1,x_2),\qquad \dots \text{ until } \eos .
+  \]
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item Temperature, top-$k$, top-$p$, beam search (Module 7) modify this sampling ---
+          and each one changes the distribution actually sampled.
+    \item Generating is \emph{one} use of $\ptheta$. Scoring a text, ranking continuations,
+          compressing are others.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Detail 3: the factorization is not unique}
+  The chain rule holds in any order of the positions.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item Left$\to$right is convenience: text is produced that way.\\
+          It defines the \dest{decoder-only} family (GPT and descendants).
+    \item \dest{Encoder-only} (BERT, Week 3) abandons the factorization and models
+          $p(x_t\mid x_{\neq t})$: one symbol given all the others.\\
+          Not a joint distribution in any simple way --- but useful for representing text.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{The target: approximate $\pstar$}
+  ``A good model gives high probability to plausible text.'' \emph{Plausible according to
+  whom?}
+
+  \vspace{0.8em}
+  \textbf{Working hypothesis of the field.} There is a distribution $\pstar$ over $\V^{*}$
+  --- the process that generated the corpus --- and the corpus is a sample
+  \[
+    x^{(1)},\dots,x^{(N)} \sim \pstar .
+  \]
+  Goal: choose $\theta$ so that $\ptheta\approx\pstar$.
+
+  \vspace{0.8em}
+  Idealized (there is no ``the English language''), but useful: it makes ``approximate''
+  precise, and its consequences hold in practice. Next section.
+\end{frame}
+
+% =====================================================================
+\section{How to measure}
+
+\begin{frame}{Maximum likelihood is cross-entropy}
+  Concatenate the corpus into one sequence $x_{1:T}$ (\eos{} between documents).
+
+  \vspace{0.4em}
+  Log-likelihood, sign flipped, divided by $T$: the MLE minimizes
+  \[
+    \Lc(\theta) \;=\; -\frac{1}{T}\sum_{t=1}^{T}\log\ptheta(x_t\mid x_{<t}),
+  \]
+  the \dest{average cross-entropy per token} --- nats with $\ln$, bits with $\log_2$.
+
+  \vspace{0.8em}
+  This is literally \texttt{F.cross\_entropy} in Lab 3: $V$ logits, softmax, $-\log$ of the
+  probability of the correct token.
+\end{frame}
+
+\begin{frame}{Why ``cross-entropy''}
+  For distributions $q, r$ on a finite set:
+  \[
+    H(q, r) := -\sum_x q(x)\log r(x) \;=\; H(q) + \KL(q\,\|\,r).
+  \]
+  \hook{Check: $-\sum q\log r = -\sum q\log q + \sum q\log(q/r)$.}
+
+  \vspace{0.8em}
+  Apply at each position, with $\pstar_t := \pstar(\cdot\mid x_{<t})$ and
+  $\ptheta^{\,t} := \ptheta(\cdot\mid x_{<t})$:
+  \[
+    \E_{x_t\sim\pstar_t}\big[-\log\ptheta(x_t\mid x_{<t})\big]
+    \;=\; \underbrace{H(\pstar_t)}_{\text{entropy of the source}}
+       + \underbrace{\KL(\pstar_t\,\|\,\ptheta^{\,t})}_{\text{model error}} .
+  \]
+\end{frame}
+
+\begin{frame}{What the decomposition says}
+  \begin{itemize}
+    \item $H(\pstar_t)$ does not depend on $\theta$: intrinsic uncertainty of the next
+          symbol.
+    \item $\KL\ge 0$, zero iff $\ptheta^{\,t} = \pstar_t$.
+    \item So minimizing cross-entropy $=$ minimizing KL to $\pstar$.
+    \item The lowest attainable loss is $H$ --- \dest{not zero}. After ``the cat slept on
+          the'', both ``couch'' and ``rug'' are fine.
+    \item ``How much is left to learn'' is $\Lc - H$, and $H$ is unknown.
+  \end{itemize}
+
+  \vspace{0.8em}
+  \begin{block}{Hook for Module 3}
+    Chinchilla: $L(N,D) = E + A/N^{\alpha} + B/D^{\beta}$. The constant $E$ \emph{is} the
+    entropy of the source.
+  \end{block}
+\end{frame}
+
+\begin{frame}{Numerical example}
+  Five tokens, probabilities $0.5,\ 0.1,\ 0.25,\ 0.05,\ 0.8$ (each given the correct prefix).
+  \begin{align*}
+    \Lc &= -\tfrac{1}{5}\big(\ln 0.5 + \ln 0.1 + \ln 0.25 + \ln 0.05 + \ln 0.8\big) \\
+        &= -\tfrac{1}{5}\big(-0.693 - 2.303 - 1.386 - 2.996 - 0.223\big) \\
+        &\approx 1.520 \text{ nats} \;\approx\; 2.19 \text{ bits per token.}
+  \end{align*}
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item The $0.05$ token contributes $2.996$: almost 40\% of the sum.
+    \item \dest{One very unlikely token outweighs several well-predicted ones.}
+    \item In the limit: a zero-probability token makes the loss infinite.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Entropy rate}
+  For a \emph{stationary} process $(X_t)$:
+  \[
+    H(\mathcal{X}) \;=\; \lim_{T\to\infty}\frac{1}{T}H(X_1,\dots,X_T)
+    \;=\; \lim_{T\to\infty}H(X_T\mid X_{<T}).
+  \]
+  Uncertainty \emph{per symbol} when the context grows without bound.
+
+  \vspace{1em}
+  \textbf{Shannon--McMillan--Breiman.} Stationary and ergodic $\Rightarrow$
+  \[
+    -\frac{1}{T}\log\pstar(X_{1:T}) \;\xrightarrow[T\to\infty]{\text{a.s.}}\; H(\mathcal{X}).
+  \]
+  A time average converges to an ensemble average. With $\ptheta$: limit $= H +$ KL rate.
+\end{frame}
+
+\begin{frame}{What SMB buys us}
+  \begin{block}{}
+    One long test corpus is enough to evaluate a language model.\\
+    The average along the sequence estimates the population quantity.
+  \end{block}
+
+  \vspace{1em}
+  Two honest caveats:
+  \begin{itemize}
+    \item Natural language is not stationary (position, topic, period).
+    \item Even so, this is what everyone reports, and comparisons are informative.\\
+          The theory guides; it does not apply literally.
+  \end{itemize}
+
+  \vspace{0.6em}
+  \hook{Proof: Cover \& Thomas, 16.8. The i.i.d.\ case is in Appendix A.2.}
+\end{frame}
+
+\begin{frame}{Shannon's experiment (1951)}
+  Ask a person to guess the \emph{next letter} of a text; count the guesses until correct.
+  The distribution of guesses bounds the entropy.
+
+  \vspace{1em}
+  \begin{itemize}
+    \item 27 symbols (26 letters + space): uniform would be $\log_2 27\approx 4.75$
+          bits/letter.
+    \item Result: about \dest{1 bit per letter} (between 0.6 and 1.3).
+    \item English is highly redundant. That redundancy is what an LM captures.
+  \end{itemize}
+
+  \vspace{1em}
+  Current neural models: below 1 bit/character on \texttt{enwik8}. Seventy years later,
+  consistent.
+\end{frame}
+
+\begin{frame}{Perplexity}
+  \[
+    \PPL \;=\; \exp(\Lc) \;=\; \Big(\prod_{t=1}^{T}\ptheta(x_t\mid x_{<t})\Big)^{-1/T}
+  \]
+  geometric mean of the inverse probabilities of the correct tokens.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item \dest{Effective number of alternatives}: $\PPL = 20$ means ``hesitating as if
+          choosing uniformly among 20''.
+    \item Uniform over $V$: $\PPL = V$. Always right: $\PPL = 1$. Our example:
+          $e^{1.520}\approx 4.57$.
+    \item A monotone transform of $\Lc$ --- no new information, more interpretable,
+          not additive (Exercise 1).
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Pitfall 1: per-token perplexity depends on the tokenizer}
+  Same text. Model A: 32k vocabulary. Model B: 128k.
+
+  \vspace{0.6em}
+  \begin{itemize}
+    \item B's tokenizer uses \emph{fewer} tokens; each token covers more characters.
+    \item Predicting one of B's tokens is harder: more information per step.
+    \item \dest{B's per-token perplexity tends to be higher even if B compresses better.}
+  \end{itemize}
+
+  \vspace{0.8em}
+  Normalize by the amount of \emph{text}, not of tokens:
+  \[
+    \text{bits per byte}
+    = \frac{\Lc_{\text{nats/token}}}{\ln 2}\cdot\frac{\#\text{tokens}}{\#\text{bytes}} .
+  \]
+\end{frame}
+
+\begin{frame}{Pitfall 1: the numbers}
+  A 4200-byte text.
+
+  \vspace{0.6em}
+  \begin{center}
+  \begin{tabular}{@{}lcccc@{}}
+    \toprule
+    & tokens & $\Lc$ (nats/token) & $\PPL$ & bits/byte \\
+    \midrule
+    Model 1 & 1000 & 3.0 & 20 & $\frac{3.0}{0.693}\cdot\frac{1000}{4200} \approx 1.03$ \\[0.6em]
+    Model 2 & 800 & 3.5 & 33 & $\frac{3.5}{0.693}\cdot\frac{800}{4200} \approx 0.96$ \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.8em}
+  Model 2: higher perplexity, \dest{better compression}.
+
+  \vspace{0.6em}
+  \begin{itemize}
+    \item Serious pretraining reports give bits per byte.
+    \item \textbf{Lab 1 and Lab 3 report both.} Otherwise $n$-gram vs.\ GPT is meaningless.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Pitfall 2: how much context the model sees}
+  Window of 1024 tokens, text of 10k tokens.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item \dest{Disjoint blocks.} Cut into blocks of 1024. The first token of each block
+          sees nothing; on average, 512 tokens of context.
+    \item \dest{Sliding window.} Each token sees the previous 1023. One pass per token:
+          expensive, but maximal context.
+  \end{itemize}
+
+  \vspace{0.8em}
+  The second gives lower perplexity. Neither is wrong; comparing them is.\\
+  \textbf{Document which one was used.}
+\end{frame}
+
+\begin{frame}{Pitfall 3: a single zero destroys everything}
+  \[
+    \ptheta(x_t\mid x_{<t}) = 0 \text{ for one } t
+    \quad\Longrightarrow\quad \Lc = \infty,\ \PPL = \infty .
+  \]
+
+  \vspace{1em}
+  Two consequences that reappear later:
+  \begin{itemize}
+    \item count-based models need \dest{smoothing} (Section 3);
+    \item \dest{byte-level} tokenization (Section 4) makes every text representable.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{In code}
+\begin{lstlisting}[style=py]
+# log_probs: log p(x_t | x_<t) in nats, one per token.
+# n_bytes:   len(text.encode("utf-8"))
+import math
+
+def cross_entropy(log_probs):             # nats per token
+    return -sum(log_probs) / len(log_probs)
+
+def perplexity(log_probs):                # "effective number of alternatives"
+    return math.exp(cross_entropy(log_probs))
+
+def bits_per_byte(log_probs, n_bytes):    # independent of the tokenizer
+    total_bits = -sum(log_probs) / math.log(2)
+    return total_bits / n_bytes
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{Modeling language is compressing}
+  \begin{block}{Claim}
+    Cross-entropy is not just \emph{a} reasonable metric.\\
+    It is the length, in bits, of the code a compressor built on the model would produce.
+  \end{block}
+
+  \vspace{1.2em}
+  \begin{enumerate}
+    \item A language model is a compressor --- via arithmetic coding.
+    \item A compressor is a language model --- via Kraft.
+  \end{enumerate}
+  Then: evidence, and why it matters for the course.
+\end{frame}
+
+\begin{frame}{Prefix codes and Kraft}
+  A binary code gives symbol $x$ a codeword of $\ell(x)$ bits.
+  \dest{Prefix-free}: no codeword is a prefix of another $\Rightarrow$ decodable without
+  separators.
+
+  \vspace{0.8em}
+  \textbf{Kraft--McMillan.} A prefix code with lengths $\ell(x)$ exists iff
+  \[
+    \sum_x 2^{-\ell(x)} \;\le\; 1 .
+  \]
+
+  \vspace{0.8em}
+  For a distribution $q$: expected length $\ge H_2(q)$, and the \emph{Shannon code}
+  $\ell(x) = \lceil -\log_2 q(x)\rceil$ is within 1 bit of it.
+
+  \vspace{0.4em}
+  \begin{block}{}
+    $-\log_2 q(x)$ is the number of bits a good code spends on $x$.
+  \end{block}
+\end{frame}
+
+\begin{frame}{From symbols to sequences: arithmetic coding}
+  Symbol by symbol wastes up to 1 bit per symbol (rounding).
+  One codeword per sequence is impossible.
+
+  \vspace{0.8em}
+  \dest{Arithmetic coding}: the whole sequence becomes \emph{one} number in $[0,1)$, using
+  \[
+    < -\log_2 p(x_{1:T}) + 2 \text{ bits in total,}
+  \]
+  and it consumes $p(\cdot\mid x_{<t})$ \textbf{one step at a time, in order} --- exactly
+  what an autoregressive model provides.
+
+  \vspace{0.8em}
+  Mechanism: keep an interval, initially $[0,1)$. At step $t$, split it into $V$ slices
+  proportional to $p(\cdot\mid x_{<t})$ and keep the slice of $x_t$.
+\end{frame}
+
+\begin{frame}{Arithmetic coding: example}
+  $\V = \{a,b,\eos\}$, fixed model $p(a) = 0.5$, $p(b) = 0.3$, $p(\eos) = 0.2$.
+  Encode $a\,b\,\eos$:
+
+  \vspace{0.6em}
+  \begin{center}
+  \begin{tabular}{@{}clll@{}}
+    \toprule
+    Step & Symbol & Interval & \\
+    \midrule
+    0 & --- & $[0,\ 1)$ & \\
+    1 & $a$ & $[0,\ 0.5)$ & first half \\
+    2 & $b$ & $[0.25,\ 0.40)$ & slice of $b$ inside $[0,\ 0.5)$ \\
+    3 & \eos & $[0.37,\ 0.40)$ & slice of \eos{} inside $[0.25,\ 0.40)$ \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.6em}
+  \begin{itemize}
+    \item Final width $0.03 = 0.5\cdot 0.3\cdot 0.2 = p(a\,b\,\eos)$. Always.
+    \item $-\log_2 0.03\approx 5.06$; with 6 bits, $0.375 = 0.011000_2$ falls inside.
+    \item The decoder redoes the splits --- it needs the same model.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Direction 1: an LM is a compressor}
+  With context, nothing changes: the slices at step $t$ are $\ptheta(\cdot\mid x_{<t})$,
+  computed from the prefix, as in generation.
+  \[
+    \frac{\ell(x_{1:T})}{T} \;\approx\; \Lc_{\text{bits/token}} .
+  \]
+
+  \vspace{0.8em}
+  \begin{block}{}
+    Cross-entropy in bits \textbf{is} the compression rate.\\
+    ``Train an LM'' and ``build an adaptive lossless compressor'' are the same problem.
+  \end{block}
+
+  \vspace{0.8em}
+  The $<2$ bits of waste do not grow with $T$.
+  \hook{The decoder needs $\theta$: model size enters the accounting --- see below.}
+\end{frame}
+
+\begin{frame}{Direction 2: a compressor is an LM}
+  Any lossless compressor $C$ (say \texttt{gzip}) defines
+  \[
+    p_C(x) \;\propto\; 2^{-|C(x)|} .
+  \]
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item By Kraft, $\sum_x 2^{-|C(x)|}\le 1$: a sub-distribution. Normalizing is hard ---
+          unnecessary for ranking.
+    \item Given a prefix, the symbol $w$ minimizing $|C(x_{<t}\,w)|$ is $p_C$'s favorite.
+    \item \texttt{gzip} predicts the next character non-trivially: a legitimate, cheap
+          baseline (Exercise 5).
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Evidence: Delétang et al.\ (ICLR 2024)}
+  LMs of several sizes $+$ arithmetic coder, on text, images (byte patches), audio.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item A 70B model trained \emph{on text only} compresses text to $\sim$8\%
+          (\texttt{gzip}: $\sim$32\%) --- and beats PNG on images and FLAC on audio.
+    \item With the model size added to the code (\emph{adjusted} rate), the 70B model only
+          wins when the corpus is much larger than the model.
+  \end{itemize}
+
+  \vspace{1em}
+  \hook{Chinchilla again: the optimal model size depends on the amount of data.}
+\end{frame}
+
+\begin{frame}{Why the compression lens matters}
+  \begin{enumerate}
+    \item A non-anthropomorphic reading of ``the model understands'':\\
+          \textbf{understanding $=$ predicting $=$ compressing}.
+    \item It explains why one scalar --- the pretraining loss --- is such a good measure of
+          general capability.
+    \item The tokenizer is a \dest{first-stage compressor}; the model compresses what is
+          left. Section 4.
+  \end{enumerate}
+\end{frame}
+
+% =====================================================================
+\section{$n$-grams}
+
+\begin{frame}{The Markov assumption}
+  Truncate the context to the $n-1$ previous symbols:
+  \[
+    p(x_t\mid x_{<t}) \;\approx\; p(x_t\mid x_{t-n+1},\dots,x_{t-1}).
+  \]
+
+  \vspace{0.6em}
+  \begin{itemize}
+    \item $n=1$ unigram (independent symbols); $n=2$ bigram; \dots
+    \item The \dest{history} $h$ is the context; the model is a table $p(w\mid h)$.
+    \item Sequences are padded with \bos{} so the first symbol has a history.
+  \end{itemize}
+
+  \vspace{0.8em}
+  \textbf{Maximum likelihood} (Appendix A.3): with $c(h,w)$ the count of $h$ followed by $w$,
+  \[
+    \hat p(w\mid h) \;=\; \frac{c(h,w)}{c(h)}, \qquad c(h) = \sum_w c(h,w).
+  \]
+\end{frame}
+
+\begin{frame}{Toy corpus}
+  18 tokens, 9 types; the period is a token. Kept in Portuguese so that every number
+  matches the notes:
+
+  \begin{center}
+    \texttt{o gato dormiu no sofá . o cachorro dormiu no tapete . o gato comeu no tapete .}
+  \end{center}
+
+  \vspace{0.4em}
+  \texttt{o} the \textperiodcentered{} \texttt{gato} cat \textperiodcentered{} \texttt{dormiu}
+  slept \textperiodcentered{} \texttt{no} on the \textperiodcentered{} \texttt{sofá} couch
+  \textperiodcentered{} \texttt{cachorro} dog \textperiodcentered{} \texttt{tapete} rug
+  \textperiodcentered{} \texttt{comeu} ate
+
+  \vspace{0.8em}
+  Unigram counts: \texttt{o} 3, \texttt{no} 3, \texttt{.} 3, \texttt{gato} 2, \texttt{dormiu}
+  2, \texttt{tapete} 2, \texttt{sofá} 1, \texttt{cachorro} 1, \texttt{comeu} 1.
+
+  \vspace{0.6em}
+  \hook{In English, ``the'' would absorb both \texttt{o} and \texttt{no} and all counts
+  would change.}
+\end{frame}
+
+\begin{frame}{Toy corpus: bigram MLE}
+  \begin{center}
+  \begin{tabular}{@{}llccc@{}}
+    \toprule
+    $h$ & $w$ & $c(h,w)$ & $c(h)$ & $\hat p(w\mid h)$ \\
+    \midrule
+    \texttt{dormiu} & \texttt{no} & 2 & 2 & 1.00 \\
+    \texttt{no} & \texttt{tapete} & 2 & 3 & 0.67 \\
+    \texttt{no} & \texttt{sofá} & 1 & 3 & 0.33 \\
+    \texttt{o} & \texttt{gato} & 2 & 3 & 0.67 \\
+    \texttt{o} & \texttt{cachorro} & 1 & 3 & 0.33 \\
+    \texttt{cachorro} & \texttt{comeu} & 0 & 1 & \dest{0.00} \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.8em}
+  Test sentence \texttt{o cachorro comeu no sofá .} (``the dog ate on the couch''):
+  reasonable, but (\texttt{cachorro}, \texttt{comeu}) was never seen.\\
+  Probability zero. $\PPL = \infty$.
+\end{frame}
+
+\begin{frame}{Sparsity}
+  An $n$-gram model has $V^{n-1}(V-1)$ free parameters.
+
+  \vspace{0.6em}
+  \begin{center}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    $V$ & $n$ & parameters \\
+    \midrule
+    $50{,}000$ & 3 & $\sim 10^{14}$ \\
+    $50{,}000$ & 5 & $\sim 10^{23}$ \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.6em}
+  A corpus of $10^{11}$ tokens sees at most $10^{11}$ distinct trigrams: a fraction
+  $10^{-3}$, most of them once.
+
+  \vspace{0.8em}
+  \dest{Curse of dimensionality} in its crudest form. Either $n$ is small, or the model is
+  full of zeros and single-observation estimates.
+\end{frame}
+
+\begin{frame}{Smoothing 1: additive (Laplace, add-$\alpha$)}
+  Add $\alpha > 0$ to every count:
+  \[
+    \hat p_\alpha(w\mid h) \;=\; \frac{c(h,w)+\alpha}{c(h)+\alpha V} .
+  \]
+  Toy corpus, $\alpha = 1$: $\hat p(\texttt{comeu}\mid\texttt{cachorro}) = \frac{1}{10}$,
+  $\hat p(\texttt{dormiu}\mid\texttt{cachorro}) = \frac{2}{10}$. The zero is gone.
+
+  \vspace{0.8em}
+  \textbf{The problem.} For most histories $c(h)$ is small and $\alpha V$ dominates.\\
+  \texttt{cachorro} (seen once) now gives 80\% of its mass to never-seen successors.\\
+  With $V = 50{,}000$: over 99.9\%.
+
+  \vspace{0.6em}
+  It is MAP with a symmetric Dirichlet prior (Appendix A.4): ``all $V$ symbols are equally
+  plausible after any history''. False.
+\end{frame}
+
+\begin{frame}{Smoothing 2: interpolation (Jelinek--Mercer)}
+  Mix orders. The lower order is less sparse and serves as fallback:
+  \[
+    \hat p_{\text{int}}(w\mid h_{n-1}) = \lambda_n\,\hat p^{\text{MLE}}(w\mid h_{n-1})
+    + (1-\lambda_n)\,\hat p_{\text{int}}(w\mid h_{n-2}),
+  \]
+  down to the unigram.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item $\lambda_n$ is tuned on \emph{validation} --- on training the optimum is
+          $\lambda = 1$.
+    \item Better variants let $\lambda$ depend on $c(h)$: more evidence, more trust in the
+          higher order.
+    \item \textbf{This is what Lab 1 asks for.}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Interpolation: the toy sentence}
+  Bigram $+$ unigram, $\lambda = 0.7$:
+  $\hat p_{\text{int}} = 0.7\,\hat p_2^{\text{MLE}} + 0.3\,\hat p_1$.
+
+  \vspace{0.6em}
+  \begin{center}
+  \begin{tabular}{@{}llccl@{}}
+    \toprule
+    $h$ & $w$ & $\hat p_2^{\text{MLE}}$ & $\hat p_1(w)$ & $\hat p_{\text{int}}$ \\
+    \midrule
+    \texttt{o} & \texttt{cachorro} & 0.333 & 0.056 & $0.7\cdot 0.333 + 0.3\cdot 0.056 = 0.250$ \\
+    \texttt{cachorro} & \texttt{comeu} & \dest{0} & 0.056 & $0 + 0.3\cdot 0.056 = 0.017$ \\
+    \texttt{comeu} & \texttt{no} & 1 & 0.167 & $0.7 + 0.3\cdot 0.167 = 0.750$ \\
+    \texttt{no} & \texttt{sofá} & 0.333 & 0.056 & $0.250$ \\
+    \texttt{sofá} & \texttt{.} & 1 & 0.167 & $0.750$ \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.6em}
+  Product $\approx 5.9\cdot 10^{-4}$; $\PPL = (5.9\cdot 10^{-4})^{-1/5}\approx 4.4$.
+  Finite, and reasonable for 9 types.
+\end{frame}
+
+\begin{frame}{Smoothing 3: Kneser--Ney --- absolute discounting}
+  Subtract a constant $D\in(0,1]$ from each positive count; give the freed mass to the lower
+  order:
+  \[
+    \hat p_{\text{KN}}(w\mid h) \;=\; \frac{\max\big(c(h,w)-D,\,0\big)}{c(h)}
+    \;+\; \frac{D\cdot N_{1+}(h\,\bullet)}{c(h)}\;p_{\text{cont}}(w),
+  \]
+  $N_{1+}(h\,\bullet)$ = number of distinct symbols that follow $h$.
+
+  \vspace{0.8em}
+  \textbf{Why subtract, not add?} Counts of rare events are overestimates; the empirical
+  correction is roughly a constant subtraction.
+\end{frame}
+
+\begin{frame}{Kneser--Ney --- continuation probability}
+  The lower order is \emph{not} the unigram $c(w)/N$ but
+  \[
+    p_{\text{cont}}(w) \;=\;
+    \frac{\big|\{h : c(h,w)>0\}\big|}{\big|\{(h,w') : c(h,w')>0\}\big|} :
+  \]
+  in how many distinct contexts $w$ appears --- not how many times.
+
+  \vspace{0.8em}
+  \textbf{``San Francisco''.} ``Francisco'' is frequent, but almost only after ``San''.\\
+  The lower order is consulted only when the context is \emph{new} --- and after a new
+  context, ``Francisco'' is a terrible bet. $p_{\text{cont}}$ knows: few distinct contexts.
+
+  \vspace{0.6em}
+  Toy corpus (12 bigram types): \texttt{o} has $\hat p_1 = 3/18$ but
+  $p_{\text{cont}} = 1/12$ --- frequent, yet predictable from context.
+\end{frame}
+
+\begin{frame}{Kneser--Ney --- status}
+  \begin{itemize}
+    \item Modified interpolated KN (Chen \& Goodman, 1998): three discounts for counts
+          $1$, $2$, $\ge 3$. State of the art for about fifteen years.
+    \item The final estimator is \dest{no longer maximum likelihood} --- a heuristic,
+          justified empirically.
+    \item A posteriori, a Bayesian reading: Teh (2006), hierarchical Pitman--Yor.
+    \item $p_{\text{cont}}$ is the \emph{unique} lower order consistent with the unigram
+          counts --- Appendix A.5.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{What $n$-grams cannot do, whatever the data}
+  \dest{1. No generalization across similar contexts.}\\
+  \texttt{gato dormiu no} and \texttt{cachorro dormiu no} share no statistics.
+  Tokens are integer indices: \texttt{gato} is as far from \texttt{cachorro} as from
+  \texttt{tapete}.
+
+  \vspace{1em}
+  \dest{2. Fixed window.}\\
+  Anything more than $n$ positions away is invisible: agreement, pronouns, the previous
+  paragraph. Increasing $n$ worsens sparsity exponentially.
+\end{frame}
+
+\begin{frame}{Why neural networks: Bengio et al.\ (2003)}
+  Each token $w$ gets a dense vector $e_w\in\mathbb{R}^d$, $d\ll V$ --- the
+  \dest{embedding}. Matrix $E\in\mathbb{R}^{V\times d}$, learned.
+  \[
+    p(w\mid h) = \mathrm{softmax}\big(W_2\,\tanh(W_1\,[e_{h_1};\dots;e_{h_{n-1}}] + b_1) + b_2\big)_w .
+  \]
+
+  \vspace{0.8em}
+  \textbf{Where the gain comes from.} If \texttt{gato} and \texttt{cachorro} appear in similar
+  contexts, gradient descent pushes their vectors together --- one computation serves both,
+  the loss drops. ``cat slept on the'' now transfers to ``dog slept on the''.
+\end{frame}
+
+\begin{frame}{Counting versus optimization}
+  \begin{block}{}
+    The neural network buys generalization at the price of replacing counting with
+    optimization.
+  \end{block}
+
+  \vspace{1em}
+  \begin{itemize}
+    \item Estimation is no longer count-and-divide: it is minimizing a non-convex function
+          of millions of parameters --- initialization, learning rate, regularization,
+          instability.
+    \item Defect 2 (fixed window) is solved by attention (Week 2): condition on the whole
+          prefix, with no $n$ fixed in advance.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Do not underestimate the baseline}
+  \begin{itemize}
+    \item Suffix arrays over the whole corpus allow $n$-gram queries of \emph{unbounded}
+          order on trillions of tokens.
+    \item Liu et al.\ (2024, \emph{Infini-gram}): interpolating with a large neural LM
+          \emph{still} lowers its perplexity --- quotations, names, memorizable sequences.
+  \end{itemize}
+
+  \vspace{1.2em}
+  \begin{block}{}
+    The $n$-gram of Lab 1 is the baseline the Transformer of Lab 3 has to beat, in the same
+    units.
+  \end{block}
+\end{frame}
+
+% =====================================================================
+\section{Tokenization}
+
+\begin{frame}{What the tokenizer does}
+  Text (Unicode characters; on disk, bytes) $\longrightarrow$ integers in $\{1,\dots,V\}$,
+  and back. Lossless, at least for ``normal'' text.
+
+  \vspace{1em}
+  \begin{itemize}
+    \item Trained \emph{before} the model, on a possibly different corpus. Then frozen.
+    \item Defines $\V$ --- hence the size of the embedding matrix $E\in\mathbb{R}^{V\times d}$
+          and of the output layer, the two largest layers of a small model.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Why subwords}
+  \begin{center}
+  \begin{tabular}{@{}llp{7.5cm}@{}}
+    \toprule
+    \textbf{Unit} & $V$ & \textbf{Problem} \\
+    \midrule
+    Byte & 256 & sequences $4$--$5\times$ longer; attention $O(T^2)$; little information per step \\
+    Character & $10^2$--$10^5$ & open vocabulary in Unicode; same length problem \\
+    Word & $\gg 10^5$ & out-of-vocabulary words; morphology ignored; huge $E$; languages without spaces \\
+    Subword & $3\cdot 10^4$--$2.5\cdot 10^5$ & \dest{the compromise}: closed vocabulary, reasonable length, rare words built from frequent pieces \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+\end{frame}
+
+\begin{frame}{The vocabulary size is a trade-off}
+  \begin{itemize}
+    \item \dest{Larger $V$}: shorter sequences --- more text per context window, cheaper
+          attention. But $E$ grows, and each token is seen fewer times: rare tokens are
+          poorly trained.
+    \item \dest{Smaller $V$}: the opposite.
+  \end{itemize}
+
+  \vspace{0.8em}
+  \begin{center}
+    \begin{tabular}{@{}lllll@{}}
+      \toprule
+      Llama 2 & GPT-4 & Llama 3 & Qwen & Gemma \\
+      \midrule
+      32k & $\sim$100k & 128k & $\sim$152k & 256k \\
+      \bottomrule
+    \end{tabular}
+  \end{center}
+
+  \vspace{0.6em}
+  Trend: upward, driven by multilinguality.
+\end{frame}
+
+\begin{frame}{Byte-Pair Encoding: training}
+  Gage (1994), a \emph{compression} algorithm; Sennrich et al.\ (2016), adapted to
+  translation.
+
+  \vspace{0.6em}
+  \begin{enumerate}
+    \item \dest{Pre-tokenize}: split into ``words''. Merges never cross a word boundary.
+    \item Start from the \dest{base alphabet}: characters, or the 256 bytes.
+    \item Count adjacent symbol pairs, weighted by word frequency.
+    \item \dest{Merge} the most frequent pair $(a,b)\to ab$; record the rule.
+    \item Repeat until $|\V|$ reaches the target.
+  \end{enumerate}
+
+  \vspace{0.6em}
+  GPT-2: $\sim$50k merges over 256 bytes.
+\end{frame}
+
+\begin{frame}{Byte-Pair Encoding: encoding new text}
+  Decompose each word into the base alphabet; apply the merges \dest{in the order they were
+  learned}.
+
+  \vspace{1.2em}
+  \begin{block}{}
+    Same vocabulary, different merge order $\Rightarrow$ different segmentation.\\
+    The vocabulary does not define the tokenizer; the ordered list of merges does.
+  \end{block}
+\end{frame}
+
+\begin{frame}{Worked example: the corpus}
+  Four Portuguese words sharing the stem \texttt{aix}:
+  \[
+    \texttt{baixo}\times 5,\quad \texttt{baixa}\times 3,\quad \texttt{abaixo}\times 2,\quad \texttt{caixa}\times 4 .
+  \]
+  Base alphabet: $\{\texttt{a, b, c, i, o, x}\}$.
+
+  \vspace{1em}
+  Count the adjacent pairs (weighted by frequency):
+  \[
+    (\texttt{a},\texttt{i})\ 14,\qquad (\texttt{i},\texttt{x})\ 14,\qquad (\texttt{b},\texttt{a})\ 10,\qquad (\texttt{x},\texttt{o})\ 7,\qquad \dots
+  \]
+
+  \vspace{0.6em}
+  A \dest{tie} already: (a,i) and (i,x). The tie-breaking rule is part of the tokenizer.
+\end{frame}
+
+\begin{frame}{Worked example: the five merges}
+  \begin{center}
+  \begin{tabular}{@{}clll@{}}
+    \toprule
+    \# & Top pair & Merge & Corpus after the merge \\
+    \midrule
+    1 & (a,i) 14 & \texttt{ai} &
+      \texttt{b\sep ai\sep x\sep o}, \texttt{b\sep ai\sep x\sep a}, \texttt{a\sep b\sep ai\sep x\sep o}, \texttt{c\sep ai\sep x\sep a} \\
+    2 & (ai,x) 14 & \texttt{aix} &
+      \texttt{b\sep aix\sep o}, \texttt{b\sep aix\sep a}, \texttt{a\sep b\sep aix\sep o}, \texttt{c\sep aix\sep a} \\
+    3 & (b,aix) 10 & \texttt{baix} &
+      \texttt{baix\sep o}, \texttt{baix\sep a}, \texttt{a\sep baix\sep o}, \texttt{c\sep aix\sep a} \\
+    4 & (baix,o) 7 & \texttt{baixo} &
+      \texttt{baixo}, \texttt{baix\sep a}, \texttt{a\sep baixo}, \texttt{c\sep aix\sep a} \\
+    5 & (c,aix) 4 & \texttt{caix} &
+      \texttt{baixo}, \texttt{baix\sep a}, \texttt{a\sep baixo}, \texttt{caix\sep a} \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \vspace{0.8em}
+  Final vocabulary, 11 symbols: $\{\texttt{a, b, c, i, o, x, ai, aix, baix, baixo, caix}\}$.
+
+  \vspace{0.4em}
+  \hook{On the board: cover row 4 and ask for the prediction before counting.}
+\end{frame}
+
+\begin{frame}{Worked example: what to notice}
+  \begin{itemize}
+    \item \dest{Morphemes emerge.} In three merges, \texttt{aix} --- shared by all four
+          words. Nothing linguistic in the algorithm; morphemes are just the sequences that
+          repeat.
+    \item \dest{Intermediate symbols stay.} \texttt{ai} no longer appears in the training
+          corpus, but it is in the vocabulary and may appear in new text.
+  \end{itemize}
+
+  \vspace{1em}
+  \dest{A word never seen: \texttt{abaixa}.}
+  \[
+    \texttt{a\sep b\sep a\sep i\sep x\sep a}
+    \;\xrightarrow{1}\; \texttt{a\sep b\sep ai\sep x\sep a}
+    \;\xrightarrow{2}\; \texttt{a\sep b\sep aix\sep a}
+    \;\xrightarrow{3}\; \texttt{a\sep baix\sep a}
+  \]
+  Merges 4 and 5 do not apply. Three tokens, built from known pieces.
+\end{frame}
+
+\begin{frame}[fragile]{Minimal BPE: training}
+\begin{lstlisting}[style=py,basicstyle=\ttfamily\tiny]
+from collections import Counter
+
+def train_bpe(words, n_merges):
+    corpus = Counter(tuple(w) for w in words)       # word -> tuple of symbols
+    merges = []
+    for _ in range(n_merges):
+        pairs = Counter()                               # 1. count adjacent pairs
+        for symbols, freq in corpus.items():
+            for a, b in zip(symbols, symbols[1:]):
+                pairs[(a, b)] += freq
+        if not pairs:
+            break
+        (a, b), _ = pairs.most_common(1)[0]             # 2. most frequent pair
+        merges.append((a, b))
+        new = {}
+        for symbols, freq in corpus.items():            # 3. replace (a, b) by a+b
+            out, i = [], 0
+            while i < len(symbols):
+                if symbols[i:i + 2] == (a, b):
+                    out.append(a + b); i += 2
+                else:
+                    out.append(symbols[i]); i += 1
+            new[tuple(out)] = freq
+        corpus = new
+    return merges                                       # the order IS the tokenizer
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Minimal BPE: encoding}
+\begin{lstlisting}[style=py]
+def encode(word, merges):
+    symbols = list(word)
+    for a, b in merges:                 # in the learned order
+        out, i = [], 0
+        while i < len(symbols):
+            if symbols[i:i + 2] == [a, b]:
+                out.append(a + b); i += 2
+            else:
+                out.append(symbols[i]); i += 1
+        symbols = out
+    return symbols
+
+c = {"baixo": 5, "baixa": 3, "abaixo": 2, "caixa": 4}
+words = [w for w, n in c.items() for _ in range(n)]
+merges = train_bpe(words, 5)         # [('a','i'), ('ai','x'), ('b','aix'), ...]
+print(encode("abaixa", merges))      # ['a', 'baix', 'a']
+\end{lstlisting}
+\hook{Byte-level version with pre-tokenization: Lab 1.}
+\end{frame}
+
+\begin{frame}{Byte-level BPE (GPT-2 onward)}
+  Base alphabet $=$ the \dest{256 byte values}; text is converted to UTF-8 first.
+
+  \vspace{0.8em}
+  \begin{enumerate}
+    \item \dest{No unknown token, ever.} Any language, emoji, binary garbage: a byte
+          sequence. Worst case, byte by byte.
+    \item \dest{No text has probability zero} at the tokenizer level --- Pitfall 3 closed
+          from the preprocessing side.
+    \item A multi-byte character can be split across tokens; a decoded prefix may not be
+          valid UTF-8. Visible in \emph{streaming}.
+  \end{enumerate}
+
+  \vspace{0.6em}
+  \hook{Bytes are renamed to printable characters for storage --- Appendix A.6.}
+\end{frame}
+
+\begin{frame}[fragile]{Regex pre-tokenization}
+  Before BPE, the text is cut by a regex; merges never cross the cuts. GPT-2:
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize,frame=single,framerule=0.3pt,rulecolor=\color{gray!50}]
+'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+\end{lstlisting}
+  Contractions; optional space $+$ letters; optional space $+$ digits; optional space $+$
+  punctuation; whitespace.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item \dest{The space belongs to the following word.} \texttt{" house"} and
+          \texttt{"house"} are different tokens, with different embeddings.
+    \item \dest{Letters and digits never mix}; punctuation stays separate.
+    \item GPT-4 / Llama 3 add a \dest{three-digit limit}: \texttt{\textbackslash p\{N\}\{1,3\}}.
+          Why: next section.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{WordPiece (BERT)}
+  Same merges as BPE, different criterion:
+  \[
+    \text{score}(a,b) \;=\; \frac{c(ab)}{c(a)\,c(b)} ,
+  \]
+  the pointwise mutual information: how much more often the pair occurs \emph{than expected}
+  under independence.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item Favors pairs whose parts are rare on their own; equivalent to maximizing unigram
+          likelihood.
+    \item Continuations carry \texttt{\#\#}: \texttt{develop}, \texttt{\#\#ment}.
+    \item Encoding is \dest{greedy longest prefix}, not re-applied merges.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Unigram (Kudo, 2018) and SentencePiece}
+  \dest{Unigram}: start from a large candidate vocabulary and \emph{prune}.
+  \begin{itemize}
+    \item A segmentation $s = (s_1,\dots,s_k)$ has probability $\prod_i p(s_i)$.
+    \item Estimate $p$ by EM (segmentation is latent); remove the tokens whose loss is
+          smallest; repeat.
+    \item Encode by Viterbi; \emph{sample} segmentations in training --- subword
+          regularization.
+  \end{itemize}
+
+  \vspace{0.8em}
+  \dest{SentencePiece}: a library (BPE or Unigram) on raw text, no whitespace
+  pre-tokenization; the space is the symbol \texttt{\_}. T5, Llama 1--2, Gemma.
+  Llama 3 moved to byte-level BPE (\texttt{tiktoken}).
+\end{frame}
+
+\begin{frame}{Consequences of tokenization}
+  \begin{block}{}
+    Each of the following is a behavior of \textbf{production models} whose cause is the
+    tokenizer --- not the architecture, not the training.
+  \end{block}
+
+  \vspace{1em}
+  \begin{enumerate}
+    \item Arithmetic
+    \item Languages other than English
+    \item Code
+    \item Spelling, counting letters, rhyming
+    \item Token boundaries and the trailing space
+    \item Under-trained tokens
+    \item The compression lens
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{1. Arithmetic}
+  Suppose \texttt{1234} is one token (a frequent year) but \texttt{12345} is
+  \texttt{123} $+$ \texttt{45}.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item The model sees numbers in \dest{inconsistent units}: one digit here, four there.
+    \item Addition needs digit alignment by position --- impossible to learn in general.
+  \end{itemize}
+
+  \vspace{0.8em}
+  Responses: the three-digit limit (GPT-4, Llama 3); digit-by-digit tokenization
+  (Llama 1--2); grouping from the \emph{right}, aligned with decimal places.
+\end{frame}
+
+\begin{frame}{2. Languages other than English}
+  Vocabularies learned on English corpora have higher \dest{fertility} --- tokens per word
+  --- elsewhere. GPT-2: \emph{development} is one token; \emph{desenvolvimento} is four or
+  five.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item More tokens per content: more money, more latency.
+    \item Less content per context window.
+    \item Fewer ``examples'' per unit of text in pretraining.
+    \item Per-token perplexity not comparable across languages.
+  \end{itemize}
+
+  \vspace{0.6em}
+  Petrov et al.\ (2023): up to 3--5$\times$ English fertility for some languages.\\
+  \textbf{Lab 1: measure it in Portuguese and English.}
+\end{frame}
+
+\begin{frame}{3. Code \quad 4. Letters}
+  \dest{Code.} GPT-2's regex isolates indentation spaces one by one: four spaces $=$ four
+  tokens before any content. Code models added tokens for runs of spaces and tabs.\\
+  General point: what the tokenizer's corpus lacked becomes expensive.
+
+  \vspace{1.2em}
+  \dest{Spelling, counting letters, rhyming.} The model never sees characters, only
+  indices. ``How many \emph{r}'s in \emph{strawberry}?'' requires reconstructing a token's
+  spelling from statistics.\\
+  \textbf{The information was destroyed before reaching the model.}
+\end{frame}
+
+\begin{frame}{5. Token boundaries \quad 6. Under-trained tokens}
+  \dest{The trailing space.} \texttt{" house"} $\neq$ \texttt{"house"}. A prompt ending in a
+  space is out of distribution. Inference libraries patch it with \emph{token healing}.
+
+  \vspace{1.2em}
+  \dest{Under-trained tokens.} Tokenizer and model are trained on different corpora. A token
+  frequent in one, absent from the other, keeps a random embedding --- and produces erratic
+  output when it shows up (Land \& Bartolo, 2024: \texttt{SolidGoldMagikarp}).
+\end{frame}
+
+\begin{frame}{7. The compression lens}
+  \begin{itemize}
+    \item BPE \emph{is} dictionary compression --- it was invented as such.
+    \item The vocabulary is a variable-length code: frequent sequences get short codes, rare
+          ones are spelled out.
+    \item The LM compresses what is left after this first stage.
+  \end{itemize}
+
+  \vspace{1em}
+  Removing the discrete stage: ByT5 (bytes, long sequences); Byte Latent Transformer
+  (Pagnoni et al., 2024) --- adaptive byte patches sized by predicted entropy.\\
+  In 2026: research, not production.
+\end{frame}
+
+% =====================================================================
+\section{Bridge}
+
+\begin{frame}{Lab 1 (M1P2), this week}
+  \begin{enumerate}
+    \item \textbf{Byte-level BPE} from scratch on a small Portuguese corpus.
+    \item \textbf{$n$-grams}, $n = 1, 2, 3$, with interpolation; $\lambda$ on validation.
+    \item \textbf{Evaluation}: perplexity \emph{and} bits per byte, on a held-out test set.
+    \item \textbf{Fertility} of your tokenizer vs.\ GPT-2's, Portuguese and English.
+  \end{enumerate}
+
+  \vspace{1em}
+  \begin{block}{}
+    Item 3 is the baseline the 10M Transformer of Lab 3 must beat --- same units, same
+    test set.
+  \end{block}
+
+  \vspace{0.8em}
+  \textbf{Week 2} starts from $E\in\mathbb{R}^{V\times d}$ --- whose size was decided today
+  --- and moves to attention.
+\end{frame}
+
+\begin{frame}{Exercises (due with Lab 1)}
+  \begin{enumerate}
+    \item \textbf{Perplexity is not additive.} Show that on a concatenation it is the
+          weighted geometric mean $\exp\!\big(\tfrac{T_1\ln P_1 + T_2\ln P_2}{T_1+T_2}\big)$.
+    \item \textbf{Bits per byte.} A: $V = 32$k, $\PPL = 12$. B: $V = 128$k, $\PPL = 15$, 20\%
+          fewer tokens. Which compresses better? What is missing for absolute values?
+    \item \textbf{BPE by hand.} The five merges; encode \texttt{baixinho}; why can GPT-2's
+          regex never merge \texttt{o} with a following space?
+    \item \textbf{MLE and MAP.} Prove $c(h,w)/c(h)$ is the MLE; show add-$\alpha$ is MAP under
+          $\mathrm{Dir}(\alpha+1)$; why is that prior bad for large $V$?
+    \item \textbf{gzip as an LM.} $p_C \propto 2^{-|C(x)|}$ with \texttt{zlib}; compare with
+          character bigrams.
+    \item \textbf{Discussion.} The loss never reaches zero. How would you estimate $H$ for a
+          corpus, and with what limitations?
+  \end{enumerate}
+\end{frame}
+
+% =====================================================================
+\section{Appendix: proofs and code}
+
+\begin{frame}{A.1 Kraft, forward direction}
+  \textbf{Claim.} Prefix code with lengths $\ell(x)$ $\Rightarrow$ $\sum_x 2^{-\ell(x)}\le 1$.
+
+  \vspace{0.8em}
+  To the codeword $c = c_1\cdots c_\ell$ associate the binary interval
+  \[
+    I(c) = \big[\,0.c_1\cdots c_\ell,\;\; 0.c_1\cdots c_\ell + 2^{-\ell}\,\big)\subset[0,1).
+  \]
+  \begin{itemize}
+    \item $c$ prefix of $c'$ $\Rightarrow$ $I(c')\subset I(c)$.
+    \item Prefix code $\Rightarrow$ the intervals are pairwise disjoint.
+    \item All inside $[0,1)$ $\Rightarrow$ total length $\sum_x 2^{-\ell(x)}\le 1$. $\square$
+  \end{itemize}
+
+  \vspace{0.6em}
+  \textbf{Converse:} sort the lengths and stack intervals of length $2^{-\ell_i}$ from the
+  left; each starts at a multiple of $2^{-\ell_i}$, i.e.\ is a word of $\ell_i$ bits.
+\end{frame}
+
+\begin{frame}{A.1 Shannon's bound and the Shannon code}
+  \textbf{Claim.} $\sum_x q(x)\ell(x)\ge H_2(q)$ for any prefix code.
+
+  \vspace{0.4em}
+  Let $r(x) = 2^{-\ell(x)}/Z$, $Z = \sum_x 2^{-\ell(x)}\le 1$. Then
+  \[
+    \sum_x q(x)\ell(x) - H_2(q)
+    = \sum_x q(x)\log_2\frac{q(x)}{2^{-\ell(x)}}
+    = \KL(q\,\|\,r) - \log_2 Z \;\ge\; 0 .\;\square
+  \]
+
+  \vspace{0.8em}
+  \textbf{Shannon code.} $\ell(x) = \lceil -\log_2 q(x)\rceil$ satisfies Kraft and
+  \[
+    \sum_x q(x)\ell(x) < H_2(q) + 1 .
+  \]
+  Within one bit. Arithmetic coding removes that bit \emph{per symbol}.
+\end{frame}
+
+\begin{frame}{A.2 AEP: the i.i.d.\ case of SMB}
+  \textbf{Claim.} $X_t$ i.i.d.\ $\sim q$ $\Rightarrow$
+  $-\frac{1}{T}\log q(X_{1:T})\to H(q)$ almost surely.
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item Independence: $\log q(X_{1:T}) = \sum_t\log q(X_t)$.
+    \item $Y_t = -\log q(X_t)$ are i.i.d.\ with $\E[Y_t] = H(q) < \infty$.
+    \item Strong law of large numbers. $\square$
+  \end{itemize}
+
+  \vspace{0.8em}
+  With $-\log\ptheta(X_t)$ instead: the limit is $H(q) + \KL(q\,\|\,\ptheta)$.\\
+  Ergodic Markov chains: same argument with the ergodic theorem.\\
+  General stationary ergodic processes: SMB proper (Cover \& Thomas 16.8).
+\end{frame}
+
+\begin{frame}{A.3 MLE for $n$-grams}
+  Log-likelihood grouped by (history, symbol):
+  \[
+    \ell(p) = \sum_h\sum_w c(h,w)\log p(w\mid h),
+    \qquad \sum_w p(w\mid h) = 1 \text{ for each } h .
+  \]
+  One problem per history. Lagrangian: $\sum_w c(h,w)\log p(w\mid h) - \mu(\sum_w p(w\mid h)-1)$.
+
+  \vspace{0.6em}
+  Differentiate: $p(w\mid h) = c(h,w)/\mu$. Sum over $w$: $\mu = c(h)$. Concave objective,
+  linear constraint: global maximum. $\square$
+
+  \vspace{0.8em}
+  \begin{block}{}
+    For $c(h,w) = 0$ the objective ignores $p(w\mid h)$; any mass there is stolen from the
+    others. \textbf{Maximum likelihood wants zeros on everything unseen.}
+  \end{block}
+\end{frame}
+
+\begin{frame}{A.4 Additive smoothing is MAP}
+  Prior $\mathrm{Dir}(\beta,\dots,\beta)$ on $p(\cdot\mid h)$, $\beta>1$.
+  Posterior $\propto\prod_w p(w\mid h)^{c(h,w)+\beta-1}$ --- the MLE problem with
+  $c(h,w)\to c(h,w)+\beta-1$:
+  \[
+    \hat p_{\text{MAP}}(w\mid h) = \frac{c(h,w) + \beta - 1}{c(h) + V(\beta - 1)}
+    \qquad(\text{add-}\alpha,\ \alpha = \beta-1).\;\square
+  \]
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item The posterior \emph{mean} gives $\alpha = \beta$; both conventions exist.
+    \item \dest{The point:} the prior is symmetric --- every symbol equally plausible after
+          every history. False for large $V$.
+    \item Kneser--Ney $\approx$ a prior informed by the lower order (Teh, 2006).
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{A.5 Kneser--Ney continuation: setup}
+  Interpolated absolute discounting, bigram case, $0<D\le 1$:
+  \[
+    \hat p(w\mid v) = \frac{\max(c(v,w)-D,\,0)}{c(v)} + \frac{D\,N_{1+}(v\,\bullet)}{c(v)}\,p_{\text{low}}(w),
+  \]
+  with $p_{\text{low}}$ unknown.
+
+  \vspace{1em}
+  \textbf{Marginal constraint:} regenerating the corpus from the observed histories must
+  reproduce each unigram count,
+  \[
+    \sum_v c(v)\,\hat p(w\mid v) \;=\; c(\bullet\,w) \quad\text{for every } w .
+  \]
+\end{frame}
+
+\begin{frame}{A.5 Kneser--Ney continuation: solution}
+  Substitute. Since $D\le 1$ and counts are integers,
+  \[
+    \sum_v\max(c(v,w)-D,0) = c(\bullet\,w) - D\,N_{1+}(\bullet\,w),
+    \qquad
+    \sum_v N_{1+}(v\,\bullet) = N_{1+}(\bullet\,\bullet).
+  \]
+  The constraint becomes
+  \[
+    c(\bullet\,w) - D\,N_{1+}(\bullet\,w) + D\,p_{\text{low}}(w)\,N_{1+}(\bullet\,\bullet) = c(\bullet\,w),
+  \]
+  so
+  \[
+    \boxed{\,p_{\text{low}}(w) = \frac{N_{1+}(\bullet\,w)}{N_{1+}(\bullet\,\bullet)}\,}
+    \qquad\text{the continuation probability.}\;\square
+  \]
+
+  \vspace{0.4em}
+  Checked on the toy corpus with $D = 0.75$: every $\hat p(\cdot\mid v)$ sums to 1 and the
+  marginals match exactly.
+\end{frame}
+
+\begin{frame}{A.5 Modified Kneser--Ney (Chen \& Goodman, 1998)}
+  Three discounts $D_1, D_2, D_{3+}$ for counts $1, 2, \ge 3$, estimated from the corpus
+  with $n_k$ = number of $n$-grams seen exactly $k$ times:
+  \[
+    Y = \frac{n_1}{n_1 + 2n_2},\qquad
+    D_1 = 1 - 2Y\frac{n_2}{n_1},\qquad
+    D_2 = 2 - 3Y\frac{n_3}{n_2},\qquad
+    D_{3+} = 3 - 4Y\frac{n_4}{n_3}.
+  \]
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item A leave-one-out argument: how much would the count drop if one occurrence were
+          removed?
+    \item Lower orders remain continuation distributions, recursively.
+    \item On tiny corpora (toy: $n_3 = 0$) the formulas degenerate; thousands of tokens
+          suffice in practice.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{A.6 GPT-2's byte$\to$Unicode mapping}
+  The vocabulary is saved as JSON strings, but many bytes are not printable and the space
+  breaks serialization.
+
+  \vspace{0.8em}
+  Fixed bijection between the 256 bytes and 256 printable characters:
+  \begin{itemize}
+    \item 188 bytes already printable in Latin-1 map to themselves;
+    \item the other 68 go, in order, to U+0100 onward (\texttt{\={A}}, \texttt{\={a}},
+          \texttt{\u{A}}, \dots).
+  \end{itemize}
+
+  \vspace{0.8em}
+  Hence \texttt{" the"} shows up as \texttt{\.{G}the}: \texttt{\.{G}} (U+0120) is byte 32,
+  the space. A renaming only; no effect on the model.
+\end{frame}
+
+\begin{frame}[fragile]{B.1 Interpolated $n$-grams: training}
+\begin{lstlisting}[style=py,basicstyle=\ttfamily\scriptsize]
+import math
+from collections import defaultdict, Counter
+BOS, EOS = "<bos>", "<eos>"
+
+class InterpolatedNGram:
+    def __init__(self, n, lambdas):             # lambdas: unigram -> order n, sum to 1
+        assert len(lambdas) == n and abs(sum(lambdas) - 1) < 1e-9
+        self.n, self.lambdas = n, lambdas
+        self.counts = [defaultdict(Counter) for _ in range(n)]   # counts[k][h][w]
+        self.vocab = set()
+
+    def train(self, sequences):
+        for seq in sequences:
+            toks = [BOS] * (self.n - 1) + list(seq) + [EOS]
+            self.vocab.update(toks)
+            for t in range(self.n - 1, len(toks)):
+                for k in range(self.n):             # for each order k+1
+                    h = tuple(toks[t - k:t])        # history of length k
+                    self.counts[k][h][toks[t]] += 1
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{B.1 Interpolated $n$-grams: probability and evaluation}
+\begin{lstlisting}[style=py,basicstyle=\ttfamily\tiny]
+    def prob(self, w, history):
+        p = 0.0
+        for k in range(self.n):
+            h = tuple(history[len(history) - k:]) if k > 0 else tuple()
+            c_h = self.counts[k].get(h)
+            p_mle = c_h[w] / sum(c_h.values()) if c_h else 0.0   # unseen history: 0
+            p += self.lambdas[k] * p_mle
+        return p
+
+    def evaluate(self, sequences, n_bytes=None):
+        log_probs = []
+        for seq in sequences:
+            toks = [BOS] * (self.n - 1) + list(seq) + [EOS]
+            for t in range(self.n - 1, len(toks)):
+                p = self.prob(toks[t], toks[:t])
+                log_probs.append(math.log(p) if p > 0 else float("-inf"))
+        ce = -sum(log_probs) / len(log_probs)
+        bpb = (-sum(log_probs) / math.log(2)) / n_bytes if n_bytes else None
+        return ce, math.exp(ce), bpb
+\end{lstlisting}
+\vspace{-0.2em}
+\hook{Toy corpus, $n=2$, $\lambda=(0.3,0.7)$: $\PPL = 4.49$ vs.\ 4.43 by hand --- here the unigram
+counts \bos/\eos. Tune $\lambda$ on validation.}
+\end{frame}
+
+\begin{frame}[fragile]{B.2 Fertility of a tokenizer}
+\begin{lstlisting}[style=py]
+import re
+import tiktoken                      # pip install tiktoken
+
+def fertility(text, encode):         # tokens per word
+    words = re.findall(r"\w+", text)
+    return len(encode(text)) / len(words)
+
+enc_gpt2 = tiktoken.get_encoding("gpt2")
+pt = "O desenvolvimento de modelos exige corpora amplos."
+en = "The development of models needs large corpora."
+for name, txt in [("pt", pt), ("en", en)]:
+    print(name, round(fertility(txt, enc_gpt2.encode), 2))
+\end{lstlisting}
+\hook{Expected: much higher fertility in Portuguese. In the lab, use long texts and your own
+BPE for comparison.}
+\end{frame}
+
+\begin{frame}{References: textbooks and classic papers}
+  \small
+  \begin{itemize}
+    \item Jurafsky \& Martin, \emph{Speech and Language Processing}, 3rd ed., chs.~2--3.
+    \item Raschka, \emph{Build a Large Language Model (From Scratch)}, Manning, 2024, ch.~2.
+    \item Cover \& Thomas, \emph{Elements of Information Theory}: chs.~4, 5; §13.3; §16.8.
+    \item Shannon, Prediction and entropy of printed English, \emph{BSTJ}, 1951.
+    \item Bengio et al., A neural probabilistic language model, \emph{JMLR}, 2003.
+    \item Chen \& Goodman, An empirical study of smoothing techniques, Harvard TR, 1998.
+    \item Teh, A hierarchical Bayesian LM based on Pitman--Yor processes, \emph{ACL}, 2006.
+    \item Gage, A new algorithm for data compression, 1994.
+          Sennrich, Haddow \& Birch, subword units, \emph{ACL}, 2016.
+    \item Schuster \& Nakajima, WordPiece, \emph{ICASSP}, 2012.
+          Kudo, Subword regularization, \emph{ACL}, 2018.
+          Kudo \& Richardson, SentencePiece, \emph{EMNLP}, 2018.
+    \item Radford et al., GPT-2, 2019.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{References: recent work, code}
+  \small
+  \begin{itemize}
+    \item Delétang et al., Language modeling is compression, \emph{ICLR}, 2024.
+    \item Petrov et al., Tokenizers introduce unfairness between languages, \emph{NeurIPS}, 2023.
+    \item Land \& Bartolo, Fishing for Magikarp, \emph{EMNLP}, 2024.
+    \item Liu et al., Infini-gram, \emph{COLM}, 2024.
+    \item Pagnoni et al., Byte Latent Transformer, 2024.
+  \end{itemize}
+
+  \vspace{1em}
+  \textbf{Code and video}
+  \begin{itemize}
+    \item Karpathy, \emph{Let's build the GPT tokenizer} and \texttt{minbpe} --- reference for
+          Lab 1.
+    \item \texttt{tiktoken} (OpenAI), \texttt{tokenizers} (Hugging Face).
+  \end{itemize}
+\end{frame}
+
+\end{document}

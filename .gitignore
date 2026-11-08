@@ -1,0 +1,12 @@
+/_site/
+/.quarto/
+/_freeze/
+/labs/data/
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+*.vrb
+.ipynb_checkpoints/
