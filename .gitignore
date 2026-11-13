@@ -10,3 +10,5 @@
 *.toc
 *.vrb
 .ipynb_checkpoints/
+
+**/*.quarto_ipynb

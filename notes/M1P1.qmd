@@ -38,8 +38,15 @@ Three remarks before moving on.
 
 ## Autoregressive factorization
 
-By the chain rule of probability --- which holds for any joint distribution, with no additional assumption --- $$p(x_1,x_2,\dots,x_T) \;=\; p(x_1)\,p(x_2\mid x_1)\,p(x_3\mid x_1,x_2)\cdots
-  p(x_T\mid x_1,\dots,x_{T-1}) \;=\; \prod_{t=1}^{T} p(x_t\mid x_{<t}).$$
+By the chain rule of probability --- which holds for any joint distribution, with no additional assumption ---
+
+$$
+\begin{aligned}
+p(x_1,x_2,\dots,x_T)
+  &= p(x_1)\,p(x_2\mid x_1)\,p(x_3\mid x_1,x_2)\cdots p(x_T\mid x_1,\dots,x_{T-1})\\
+  &= \prod_{t=1}^{T} p(x_t\mid x_{<t}).
+\end{aligned}
+$$
 
 For $T=3$, explicitly: $p(x_1,x_2,x_3) = p(x_1)\,p(x_2\mid x_1)\,p(x_3\mid x_1,x_2)$. The first factor is conditioned on the empty prefix.
 
